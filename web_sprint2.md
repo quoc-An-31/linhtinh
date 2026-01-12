@@ -6,6 +6,498 @@
 
 ---
 
+## 🔄 NOTIFICATION SYSTEM - WORKFLOW & ARCHITECTURE
+
+### **📊 Overview: Luồng hoạt động khi app được deploy**
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     PRODUCTION DEPLOYMENT                        │
+│                                                                  │
+│  Backend (Render/Heroku)          Frontend (Vercel)            │
+│  ├── NestJS Server                ├── React App                 │
+│  ├── Socket.IO Server             ├── Socket.IO Client          │
+│  └── PostgreSQL (Supabase)        └── Browser Notifications     │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### **🎯 Notification Flow - End-to-End**
+
+```mermaid
+sequenceDiagram
+    participant C as Customer (Browser)
+    participant F as Frontend (React)
+    participant WS as WebSocket Server
+    participant API as Backend API
+    participant DB as Database
+    participant W as Waiter (Browser)
+    participant K as Kitchen (Browser)
+
+    Note over C,K: 1️⃣ INITIAL CONNECTION
+    F->>WS: Connect with JWT token
+    WS->>WS: Verify JWT
+    WS->>WS: Store userId + roles
+    WS->>WS: Join rooms: user:xxx, role:customer
+    WS-->>F: Connection established
+
+    Note over C,K: 2️⃣ CUSTOMER PLACES ORDER
+    C->>F: Click "Place Order"
+    F->>API: POST /api/orders (order data)
+    API->>DB: Create order record
+    API->>WS: notifyNewOrder(order)
+    WS->>W: Emit "new_order" to role:waiter
+    WS->>API: Save notification to DB
+    DB-->>API: Notification saved
+    W->>W: Show toast notification
+    W->>W: Update notifications dropdown
+    
+    Note over C,K: 3️⃣ WAITER ACCEPTS ORDER
+    W->>API: PATCH /api/orders/:id/status {status: "accepted"}
+    API->>DB: Update order status
+    API->>WS: notifyOrderAccepted(order)
+    WS->>K: Emit "order_accepted" to role:kitchen
+    WS->>C: Emit "order_status_update" to user:customerId
+    K->>K: Show toast + Display on KDS
+    C->>C: Show "Order Accepted" toast
+    
+    Note over C,K: 4️⃣ KITCHEN MARKS READY
+    K->>API: PATCH /api/orders/:id/status {status: "ready"}
+    API->>DB: Update order status
+    API->>WS: notifyOrderReady(order)
+    WS->>W: Emit "order_ready" to role:waiter
+    WS->>C: Emit "order_status_update" to user:customerId
+    W->>W: Show notification
+    C->>C: Show "Order Ready" toast
+    
+    Note over C,K: 5️⃣ WAITER SERVES ORDER
+    W->>API: PATCH /api/orders/:id/status {status: "served"}
+    API->>DB: Update order status
+    API->>WS: notifyOrderServed(order)
+    WS->>C: Emit "order_status_update" to user:customerId
+    C->>C: Show "Order Served" toast
+```
+
+### **🏗️ System Architecture - Components**
+
+#### **Backend Components:**
+
+```
+backend/
+├── src/
+│   ├── notifications/
+│   │   ├── notifications.gateway.ts      # 🔌 WebSocket Gateway (Socket.IO server)
+│   │   ├── notifications.service.ts      # 💾 Save/Retrieve notifications from DB
+│   │   ├── notifications.controller.ts   # 🌐 REST API for notifications
+│   │   └── notifications.module.ts       # 📦 Module definition
+│   │
+│   ├── orders/
+│   │   ├── orders.service.ts            # 📤 Triggers notifications after order updates
+│   │   └── orders.controller.ts         # 🎯 Order CRUD endpoints
+│   │
+│   └── prisma/
+│       └── schema.prisma                # 🗄️ notifications table
+```
+
+#### **Frontend Components:**
+
+```
+frontend/
+├── src/
+│   ├── contexts/
+│   │   ├── SocketContext.tsx           # 🔌 Manage Socket.IO connection
+│   │   └── NotificationsContext.tsx    # 📬 Manage notifications state
+│   │
+│   ├── components/
+│   │   └── NotificationBell.tsx        # 🔔 UI component (bell icon + dropdown)
+│   │
+│   └── pages/
+│       ├── customer/
+│       │   └── OrderStatusPage.tsx     # 📊 Customer tracking orders
+│       ├── waiter/
+│       │   └── OrdersPage.tsx          # 👨‍💼 Waiter pending orders
+│       └── kitchen/
+│           └── KDSPage.tsx             # 👨‍🍳 Kitchen Display System
+```
+
+### **🔐 Authentication Flow - WebSocket**
+
+```typescript
+// CLIENT SIDE (Frontend):
+const socket = io('https://your-backend.com/notifications', {
+  auth: {
+    token: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...' // JWT from localStorage
+  }
+});
+
+// SERVER SIDE (Backend):
+async handleConnection(client: Socket) {
+  const token = client.handshake.auth.token;
+  const payload = this.jwtService.verify(token); // { sub: userId, roles: ['waiter'] }
+  
+  // Store client info
+  this.connectedClients.set(client.id, {
+    userId: payload.sub,
+    roles: payload.roles
+  });
+  
+  // Join rooms
+  client.join(`user:${payload.sub}`);        // Personal room
+  payload.roles.forEach(role => {
+    client.join(`role:${role}`);              // Role-based room
+  });
+}
+```
+
+### **📡 Room-Based Broadcasting Strategy**
+
+```typescript
+// ROOM STRUCTURE:
+{
+  "user:abc123": [socketId1],                    // Personal notifications
+  "role:waiter": [socketId2, socketId3],         // All waiters
+  "role:kitchen": [socketId4, socketId5],        // All kitchen staff
+  "role:admin": [socketId6],                     // All admins
+  "role:customer": [socketId7, socketId8, ...]   // All customers
+}
+
+// EMIT STRATEGIES:
+
+// 1. To specific user (e.g., customer who placed order)
+this.server.to(`user:${customerId}`).emit('order_status_update', data);
+
+// 2. To all waiters (e.g., new order notification)
+this.server.to(`role:waiter`).emit('new_order', data);
+
+// 3. To all kitchen staff (e.g., order accepted)
+this.server.to(`role:kitchen`).emit('order_accepted', data);
+
+// 4. To all admins (e.g., order rejected)
+this.server.to(`role:admin`).emit('order_rejected', data);
+```
+
+### **🔄 Complete Code Workflow - Example: Customer Places Order**
+
+#### **Step 1: Frontend - Customer clicks "Place Order"**
+
+```typescript
+// File: frontend/src/pages/customer/CartPage.tsx
+
+const handlePlaceOrder = async () => {
+  try {
+    // API call to create order
+    const response = await api.post('/orders', {
+      restaurant_id: restaurantId,
+      table_id: tableId,
+      items: cartItems.map(item => ({
+        menu_item_id: item.id,
+        quantity: item.quantity,
+        modifiers: item.selectedModifiers
+      }))
+    });
+    
+    const orderId = response.data.id;
+    navigate(`/customer/order-status/${orderId}`);
+    
+  } catch (error) {
+    console.error('Failed to place order:', error);
+  }
+};
+```
+
+#### **Step 2: Backend API - Create order and trigger notification**
+
+```typescript
+// File: backend/src/orders/orders.service.ts
+
+async create(createDto: CreateOrderDto) {
+  // 1. Validate and create order in database
+  const order = await this.prisma.order.create({
+    data: {
+      restaurant_id: createDto.restaurant_id,
+      table_id: createDto.table_id,
+      order_number: `ORD-${Date.now()}`,
+      status: 'pending',
+      // ... other fields
+    },
+    include: {
+      table: true,
+      order_items: { include: { menu_item: true } }
+    }
+  });
+
+  // 2. 🔔 TRIGGER REAL-TIME NOTIFICATION
+  await this.notificationsGateway.notifyNewOrder(order);
+
+  // 3. 💾 SAVE NOTIFICATION TO DATABASE
+  const waiters = await this.prisma.user.findMany({
+    where: {
+      user_roles: { some: { role: { name: 'waiter' } } },
+      status: 'active'
+    }
+  });
+
+  for (const waiter of waiters) {
+    await this.notificationsService.createNotification({
+      user_id: waiter.id,
+      type: 'new_order',
+      title: 'New Order',
+      message: `Order #${order.order_number} from Table ${order.table.table_number}`,
+      data: { order_id: order.id }
+    });
+  }
+
+  return order;
+}
+```
+
+#### **Step 3: WebSocket Gateway - Broadcast to waiters**
+
+```typescript
+// File: backend/src/notifications/notifications.gateway.ts
+
+async notifyNewOrder(order: any) {
+  const notification = {
+    type: 'new_order',
+    title: 'New Order Received',
+    message: `New order #${order.order_number} from Table ${order.table.table_number}`,
+    data: {
+      order_id: order.id,
+      order_number: order.order_number,
+      table_number: order.table.table_number,
+      total: order.total,
+      items_count: order.order_items.length
+    },
+    timestamp: new Date().toISOString()
+  };
+
+  // 📡 EMIT TO ALL WAITERS
+  this.server.to('role:waiter').emit('new_order', notification);
+  
+  // Also emit to admins
+  this.server.to('role:admin').emit('new_order', notification);
+
+  this.logger.log(`✅ Notified waiters: New order ${order.order_number}`);
+}
+```
+
+#### **Step 4: Frontend - Waiter receives notification**
+
+```typescript
+// File: frontend/src/contexts/NotificationsContext.tsx
+
+useEffect(() => {
+  if (!socket || !user) return;
+
+  // 🎧 LISTEN TO 'new_order' EVENT
+  socket.on('new_order', (data) => {
+    console.log('📦 New order notification:', data);
+    
+    // Show toast notification
+    toast('🔔 ' + data.message, {
+      icon: '📦',
+      duration: 5000,
+      onClick: () => {
+        navigate(`/waiter/orders/${data.data.order_id}`);
+      }
+    });
+    
+    // Refresh notifications list
+    fetchNotifications();
+  });
+
+  return () => {
+    socket.off('new_order');
+  };
+}, [socket, user]);
+```
+
+#### **Step 5: Waiter UI - Display notification**
+
+```typescript
+// File: frontend/src/components/NotificationBell.tsx
+
+export const NotificationBell: React.FC = () => {
+  const { notifications, unreadCount } = useNotifications();
+
+  return (
+    <div className="notification-bell">
+      <button onClick={() => setIsOpen(!isOpen)}>
+        <BellIcon />
+        {unreadCount > 0 && (
+          <span className="badge">{unreadCount}</span>  {/* 🔴 Red badge */}
+        )}
+      </button>
+
+      {isOpen && (
+        <div className="dropdown">
+          {notifications.map(notification => (
+            <div className="notification-item">
+              📦 {notification.message}
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+```
+
+### **🚀 Deployment Configuration**
+
+#### **Backend (Render/Heroku) - Environment Variables:**
+
+```env
+# .env (Production)
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+JWT_SECRET=your-production-secret-key
+FRONTEND_URL=https://your-frontend.vercel.app    # For CORS
+
+# Socket.IO will automatically work with HTTPS
+# No additional config needed for WebSocket over SSL
+```
+
+#### **Frontend (Vercel) - Environment Variables:**
+
+```env
+# .env.production
+VITE_API_URL=https://your-backend.render.com
+VITE_SOCKET_URL=https://your-backend.render.com/notifications
+
+# Socket.IO automatically upgrades HTTP → WebSocket
+# Works with HTTPS without additional configuration
+```
+
+#### **Socket.IO Connection in Production:**
+
+```typescript
+// Frontend - Automatic protocol upgrade
+const socket = io(import.meta.env.VITE_SOCKET_URL, {
+  auth: { token: getAuthToken() },
+  transports: ['websocket', 'polling'],  // Fallback to polling if WebSocket fails
+  reconnection: true,
+  reconnectionAttempts: 5,
+  reconnectionDelay: 1000
+});
+
+// Backend - CORS configuration
+@WebSocketGateway({
+  cors: {
+    origin: process.env.FRONTEND_URL,  // https://your-frontend.vercel.app
+    credentials: true
+  },
+  namespace: '/notifications'
+})
+```
+
+### **⚡ Performance & Scalability Considerations**
+
+#### **1. Connection Management:**
+```typescript
+// Track connected clients
+private connectedClients = new Map<string, ClientInfo>();
+
+// Cleanup on disconnect
+handleDisconnect(client: Socket) {
+  this.connectedClients.delete(client.id);
+}
+```
+
+#### **2. Room Optimization:**
+- Use rooms instead of broadcasting to all clients
+- Only emit to relevant roles/users
+- Reduces unnecessary network traffic
+
+#### **3. Database Persistence:**
+```typescript
+// Save notifications to DB for:
+// - Offline users (can see when they reconnect)
+// - Notification history
+// - Audit trail
+await this.notificationsService.createNotification({
+  user_id: waiter.id,
+  type: 'new_order',
+  message: 'New order received'
+});
+```
+
+#### **4. Reconnection Strategy:**
+```typescript
+// Frontend - Auto-reconnect with exponential backoff
+const socket = io(url, {
+  reconnection: true,
+  reconnectionAttempts: 5,      // Try 5 times
+  reconnectionDelay: 1000,       // Start with 1 second
+  reconnectionDelayMax: 5000     // Max 5 seconds
+});
+
+socket.on('connect', () => {
+  // Fetch missed notifications from database
+  fetchNotifications();
+});
+```
+
+### **🧪 Testing Notification Flow**
+
+#### **Test Case 1: New Order Notification**
+
+```bash
+# Terminal 1: Start Backend
+cd backend
+npm run start:dev
+
+# Terminal 2: Start Frontend (Waiter)
+cd frontend
+npm run dev
+
+# Terminal 3: Start Frontend (Customer)
+# Open another browser tab on different port or incognito
+
+# Steps:
+# 1. Login as Customer → Place order
+# 2. Check Waiter browser → Should see notification bell badge
+# 3. Check browser console → Should see "📦 New order notification"
+# 4. Check database → Notification record should be saved
+```
+
+#### **Test Case 2: WebSocket Connection**
+
+```typescript
+// Browser Console (Frontend)
+// Check if socket is connected
+console.log('Socket connected:', window.socketConnection);
+
+// Backend Logs
+// Should see:
+// ✅ Client connected: socketId123 | User: userId456 | Roles: waiter
+```
+
+### **🐛 Common Issues & Solutions**
+
+| Issue | Cause | Solution |
+|-------|-------|----------|
+| Socket not connecting | CORS configuration wrong | Update `cors.origin` in `@WebSocketGateway` |
+| Notifications not received | JWT token not sent | Check `auth: { token }` in socket connection |
+| Multiple connections | Multiple socket instances | Use singleton pattern or Context |
+| Missing notifications | Not joined to correct room | Verify `client.join()` logic |
+| Notification badge not updating | State not refreshing | Call `fetchNotifications()` after socket event |
+
+### **📋 Checklist - Notification System Working**
+
+- [ ] ✅ Backend Socket.IO server running on `/notifications` namespace
+- [ ] ✅ Frontend connects with JWT token successfully
+- [ ] ✅ Client joins correct rooms (user:xxx, role:xxx)
+- [ ] ✅ New order → Waiter receives notification
+- [ ] ✅ Order accepted → Kitchen receives notification
+- [ ] ✅ Order ready → Waiter receives notification
+- [ ] ✅ Order served → Customer receives notification
+- [ ] ✅ Toast notifications display correctly
+- [ ] ✅ Notification badge updates in real-time
+- [ ] ✅ Notifications saved to database
+- [ ] ✅ Can mark notifications as read
+- [ ] ✅ Works in production (HTTPS/WSS)
+
+---
+
 ## 📦 DEPENDENCIES & LIBRARIES CẦN CÀI ĐẶT
 
 ### Backend Dependencies
