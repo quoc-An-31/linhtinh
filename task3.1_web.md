@@ -1,2010 +1,2944 @@
-# 💳 TASK 3.1: TÍCH HỢP CÁC CỔNG THANH TOÁN
+# 💳 TASK 3.1: TÍCH HỢP THANH TOÁN - PHIÊN BẢN BATCH PAYMENT
 
-> **Thời gian ước tính:** 14-16 giờ  
+> **Thời gian ước tính:** 16-18 giờ  
 > **Độ ưu tiên:** Critical  
-> **Phụ thuộc:** Order system (hoàn thành), Database migration (bảng payments & payment_methods)
+> **Cập nhật:** 14/01/2026 - Thêm Git Workflow + Chi tiết Phase 3
 
 ---
 
-## 📋 TỔNG QUAN TASK
+## 🔀 GIT WORKFLOW CHO TASK NÀY
 
-### **Mục tiêu:**
-Tích hợp 4 phương thức thanh toán: **MoMo**, **ZaloPay**, **VNPay**, và **Tiền mặt** để customer có thể thanh toán order linh hoạt.
-
-### **Các deliverables:**
-- ✅ `POST /api/payments/create` - Tạo payment request (hỗ trợ 4 methods)
-- ✅ `POST /api/payments/momo/callback` - Handle MoMo webhook
-- ✅ `POST /api/payments/zalopay/callback` - Handle ZaloPay callback
-- ✅ `POST /api/payments/vnpay/ipn` - Handle VNPay IPN
-- ✅ `POST /api/payments/cash/confirm` - Xác nhận thanh toán tiền mặt
-- ✅ `GET /api/payments/:orderId/status` - Kiểm tra trạng thái thanh toán
-- ✅ Payment records trong database với payment_methods table
-- ✅ Order status update sau khi payment thành công
-- ✅ Real-time notifications cho customer & admin
-
-### **Sơ đồ luồng (MoMo/ZaloPay/VNPay):**
-```mermaid
-sequenceDiagram
-    Customer->>Frontend: Click "Thanh toán"
-    Frontend->>Backend: POST /api/payments/create (method: momo/zalopay/vnpay)
-    Backend->>Database: Create payment record (status: pending)
-    Backend->>Gateway: Request payment URL
-    Gateway-->>Backend: Return payUrl
-    Backend-->>Frontend: Return payment URL + QR code
-    Frontend->>Customer: Hiển thị QR code / redirect
-    Customer->>Gateway: Hoàn tất thanh toán
-    Gateway->>Backend: POST /callback (webhook/IPN)
-    Backend->>Database: Update payment (status: completed)
-    Backend->>Database: Update order (status: completed)
-    Backend->>Socket.IO: Emit payment_success notification
-    Socket.IO-->>Customer: "Thanh toán thành công!"
-    Socket.IO-->>Admin: "Nhận thanh toán cho Order #123"
+### **Branch:**
+```bash
+git checkout develop && git pull
+git checkout -b feature/sprint3-task-3.1-batch-payment
 ```
 
-### **Sơ đồ luồng (Tiền mặt):**
-```mermaid
-sequenceDiagram
-    Customer->>Frontend: Click "Thanh toán tiền mặt"
-    Frontend->>Backend: POST /api/payments/create (method: cash)
-    Backend->>Database: Create payment record (status: pending)
-    Backend-->>Frontend: Success (waiting confirmation)
-    Frontend-->>Customer: "Chờ waiter xác nhận"
-    
-    Waiter->>Waiter App: Xem pending cash payment
-    Customer->>Waiter: Đưa tiền mặt
-    Waiter->>Waiter App: Input số tiền nhận + confirm
-    Waiter App->>Backend: POST /api/payments/cash/confirm
-    Backend->>Database: Update payment (status: completed)
-    Backend->>Socket.IO: Emit payment_success
-    Socket.IO-->>Customer: "Thanh toán thành công!"
+### **Commits theo Phase:**
+
+| Phase | Commits | Est. Time |
+|-------|---------|-----------|
+| 1 | `feat(database): add bill_requests and payments migration` | 1h |
+| 2 | `feat(bill-request): implement service and controller` | 3h |
+| 3 | `feat(payment): implement 4 gateway services` | 6h |
+| 3 | `feat(payment): implement PaymentsService core methods` | 3h |
+| 4 | `feat(socket): add bill request and payment events` | 2h |
+| 5 | `test(payment): add unit tests for services` | 2h |
+| 5 | `docs(payment): update env variables and README` | 1h |
+
+### **Merge khi hoàn thành:**
+```bash
+git push origin feature/sprint3-task-3.1-batch-payment
+# Create PR → Review → Merge to develop
 ```
 
 ---
 
-## 🗄️ DATABASE SCHEMA
+## 📋 THAY ĐỔI SO VỚI PHIÊN BẢN CŨ
 
-### **1. Tạo Migration: `prisma/migrations/004_add_payment_methods.sql`**
+| Phiên bản cũ             | Phiên bản mới (Batch Payment)                  |
+| ------------------------ | ---------------------------------------------- |
+| 1 order → 1 payment      | N orders → 1 payment (gộp bill)                |
+| Customer tự thanh toán   | Customer request → Waiter confirm → Thanh toán |
+| Không có tips            | Có tips (tiền boa)                             |
+| QR hiển thị cho customer | QR hiển thị ở màn hình Waiter                  |
+| Không có bill_requests   | Thêm bảng `bill_requests`                      |
+
+---
+
+## 🎯 FLOW MỚI: BILL REQUEST
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              CUSTOMER FLOW                                   │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1. Customer ăn xong → Bấm "Request Bill" (Yêu cầu thanh toán)              │
+│  2. Modal hiện: Chọn Payment Method + Nhập Tips + Note                      │
+│  3. Bấm "Submit" → API tạo Bill Request                                      │
+│  4. Màn hình Customer: "Đang chờ waiter xác nhận..."                        │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                              WAITER FLOW                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  1. Socket.IO: Alert "Bàn 5 yêu cầu thanh toán - 350,000đ + 50,000đ tips"   │
+│  2. Waiter xem chi tiết bill request                                         │
+│  3. Bấm "Accept Payment Request"                                             │
+│  4. Màn hình Waiter hiển thị:                                               │
+│     - Nếu MoMo/ZaloPay/VNPay: QR code để customer scan                      │
+│     - Nếu Cash: Form nhập số tiền nhận, tiền thối                           │
+│  5. Waiter đưa QR cho customer scan HOẶC nhận tiền mặt                       │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                    │
+                                    ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           PAYMENT COMPLETION                                 │
+├─────────────────────────────────────────────────────────────────────────────┤
+│  - Online: Gateway callback → Update payment & orders → Notify              │
+│  - Cash: Waiter confirm → Update payment & orders → Notify                  │
+│  - Tất cả orders của bàn đó → status = "completed"                          │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 🗄️ DATABASE SCHEMA MỚI
+
+### **1. Bảng `bill_requests` (MỚI)**
 
 ```sql
--- ========================================
--- 1. Tạo bảng payment_methods
--- ========================================
-CREATE TABLE payment_methods (
+-- Migration: YYYYMMDD_add_bill_requests.sql
+
+CREATE TABLE bill_requests (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  code VARCHAR(20) UNIQUE NOT NULL, -- 'momo', 'zalopay', 'vnpay', 'cash'
-  name VARCHAR(50) NOT NULL, -- 'MoMo', 'ZaloPay', 'VNPay', 'Tiền mặt'
-  description TEXT,
-  logo_url VARCHAR(255),
-  is_active BOOLEAN DEFAULT true,
-  config JSONB, -- API credentials (encrypted)
-  display_order INT DEFAULT 0,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
 
--- ========================================
--- 2. Seed payment methods
--- ========================================
-INSERT INTO payment_methods (code, name, description, logo_url, display_order) VALUES
-('momo', 'MoMo', 'Ví điện tử MoMo - 40 triệu người dùng', 'https://developers.momo.vn/v3/img/logo.png', 1),
-('zalopay', 'ZaloPay', 'Ví điện tử ZaloPay - Tích hợp Zalo', 'https://cdn.zalopay.vn/logo/zalopay.png', 2),
-('vnpay', 'VNPay', 'Cổng thanh toán VNPay - ATM/Credit card', 'https://vnpay.vn/logo.png', 3),
-('cash', 'Tiền mặt', 'Thanh toán tiền mặt tại quầy', NULL, 4);
+  -- Liên kết
+  restaurant_id UUID NOT NULL REFERENCES restaurants(id) ON DELETE CASCADE,
+  table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
 
--- ========================================
--- 3. Update bảng payments (nếu đã tồn tại)
--- ========================================
--- Drop old payments table if exists
-DROP TABLE IF EXISTS payments CASCADE;
+  -- Thông tin thanh toán
+  payment_method_code VARCHAR(20) NOT NULL, -- 'momo', 'zalopay', 'vnpay', 'cash'
+  subtotal DECIMAL(12, 2) NOT NULL,         -- Tổng tiền orders
+  tips_amount DECIMAL(12, 2) DEFAULT 0,     -- Tiền tips
+  total_amount DECIMAL(12, 2) NOT NULL,     -- subtotal + tips
 
--- Create new payments table
-CREATE TABLE payments (
-  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-  payment_method_id UUID NOT NULL REFERENCES payment_methods(id),
-  amount DECIMAL(10, 2) NOT NULL,
-  status VARCHAR(20) DEFAULT 'pending', -- pending, completed, failed, refunded
-  
-  -- Gateway fields (cho MoMo, ZaloPay, VNPay)
-  gateway_request_id VARCHAR(100), -- RequestId/OrderId for tracking
-  gateway_trans_id VARCHAR(100), -- Transaction ID from gateway
-  gateway_response JSONB, -- Full response from gateway
-  
-  -- Cash payment fields
-  received_by UUID REFERENCES users(id), -- Waiter ID who received cash
-  cash_amount DECIMAL(10, 2), -- Actual cash received
-  change_amount DECIMAL(10, 2), -- Change given back
-  notes TEXT,
-  
+  -- Danh sách orders được gộp (JSON array of UUIDs)
+  order_ids JSONB NOT NULL, -- ["uuid1", "uuid2", "uuid3"]
+
+  -- Customer note
+  customer_note TEXT,
+
+  -- Trạng thái
+  status VARCHAR(20) DEFAULT 'pending',
+  -- pending: Chờ waiter accept
+  -- accepted: Waiter đã accept, đang chờ thanh toán
+  -- completed: Thanh toán thành công
+  -- cancelled: Customer/Waiter hủy
+
+  -- Waiter xử lý
+  accepted_by UUID REFERENCES users(id),
+  accepted_at TIMESTAMP,
+
   -- Timestamps
-  completed_at TIMESTAMP,
-  failed_reason TEXT,
-  refund_reason TEXT,
-  refunded_at TIMESTAMP,
-  refunded_by UUID REFERENCES users(id),
-  
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- ========================================
--- 4. Indexes
--- ========================================
-CREATE INDEX idx_payments_order ON payments(order_id);
-CREATE INDEX idx_payments_status ON payments(status);
-CREATE INDEX idx_payments_method ON payments(payment_method_id);
-CREATE INDEX idx_payments_created ON payments(created_at);
-CREATE INDEX idx_payments_gateway_request ON payments(gateway_request_id);
+-- Indexes cho performance
+CREATE INDEX idx_bill_requests_table ON bill_requests(table_id);
+CREATE INDEX idx_bill_requests_status ON bill_requests(status);
+CREATE INDEX idx_bill_requests_restaurant ON bill_requests(restaurant_id);
+CREATE INDEX idx_bill_requests_created ON bill_requests(created_at);
+
+-- Compound index cho query: "Lấy pending bill requests của restaurant"
+CREATE INDEX idx_bill_requests_restaurant_status ON bill_requests(restaurant_id, status);
 ```
 
-### **2. Update Prisma Schema: `prisma/schema.prisma`**
+### **2. Cập nhật bảng `payments`**
+
+```sql
+-- Thêm cột vào payments để liên kết với bill_request
+
+ALTER TABLE payments
+ADD COLUMN bill_request_id UUID REFERENCES bill_requests(id),
+ADD COLUMN merged_order_ids JSONB, -- Backup list order IDs
+ADD COLUMN tips_amount DECIMAL(12, 2) DEFAULT 0;
+
+-- Cho phép order_id nullable (vì giờ dùng merged_order_ids)
+ALTER TABLE payments ALTER COLUMN order_id DROP NOT NULL;
+
+-- Index
+CREATE INDEX idx_payments_bill_request ON payments(bill_request_id);
+```
+
+### **3. Prisma Schema**
 
 ```prisma
-// ========================================
-// Payment Methods Table
-// ========================================
-model PaymentMethod {
-  id          String   @id @default(uuid()) @db.Uuid
-  code        String   @unique @db.VarChar(20)
-  name        String   @db.VarChar(50)
-  description String?
-  logo_url    String?  @db.VarChar(255)
-  is_active   Boolean  @default(true)
-  config      Json?    // API credentials (encrypted)
-  
-  display_order Int    @default(0)
-  created_at  DateTime @default(now())
-  updated_at  DateTime @updatedAt
-  
-  payments    Payment[]
-  
-  @@map("payment_methods")
-}
+// schema.prisma - Thêm model mới
 
-// ========================================
-// Payments Table
-// ========================================
-model Payment {
-  id                   String    @id @default(uuid()) @db.Uuid
-  order_id             String    @db.Uuid
-  payment_method_id    String    @db.Uuid
-  amount               Decimal   @db.Decimal(10, 2)
-  status               String    @default("pending") @db.VarChar(20)
-  
-  // Gateway fields (MoMo, ZaloPay, VNPay)
-  gateway_request_id   String?   @db.VarChar(100)
-  gateway_trans_id     String?   @db.VarChar(100)
-  gateway_response     Json?
-  
-  // Cash payment fields
-  received_by          String?   @db.Uuid
-  cash_amount          Decimal?  @db.Decimal(10, 2)
-  change_amount        Decimal?  @db.Decimal(10, 2)
-  notes                String?
-  
-  completed_at         DateTime?
-  failed_reason        String?
-  refund_reason        String?
-  refunded_at          DateTime?
-  refunded_by          String?   @db.Uuid
-  
-  created_at           DateTime  @default(now())
-  updated_at           DateTime  @updatedAt
-  
+model BillRequest {
+  id                String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  restaurant_id     String   @db.Uuid
+  table_id          String   @db.Uuid
+  payment_method_code String @db.VarChar(20)
+  subtotal          Decimal  @db.Decimal(12, 2)
+  tips_amount       Decimal  @default(0) @db.Decimal(12, 2)
+  total_amount      Decimal  @db.Decimal(12, 2)
+  order_ids         Json     // Array of order UUIDs
+  customer_note     String?
+  status            String   @default("pending") @db.VarChar(20)
+  accepted_by       String?  @db.Uuid
+  accepted_at       DateTime? @db.Timestamp(6)
+  created_at        DateTime @default(now()) @db.Timestamp(6)
+  updated_at        DateTime @updatedAt @db.Timestamp(6)
+
   // Relations
-  order                Order         @relation(fields: [order_id], references: [id], onDelete: Cascade)
-  payment_method       PaymentMethod @relation(fields: [payment_method_id], references: [id])
-  received_by_user     User?         @relation("ReceivedPayments", fields: [received_by], references: [id])
-  refunded_by_user     User?         @relation("RefundedPayments", fields: [refunded_by], references: [id])
-  
-  @@index([order_id])
+  restaurant        Restaurant @relation(fields: [restaurant_id], references: [id], onDelete: Cascade)
+  table             Table      @relation(fields: [table_id], references: [id], onDelete: Cascade)
+  waiter            User?      @relation(fields: [accepted_by], references: [id])
+  payment           Payment?   // 1-1 với payment sau khi thanh toán
+
+  @@index([table_id])
   @@index([status])
-  @@index([payment_method_id])
-  @@index([gateway_request_id])
-  @@map("payments")
-}
-
-// ========================================
-// Update User model (add payment relations)
-// ========================================
-model User {
-  // ... existing fields ...
-  
-  received_payments Payment[] @relation("ReceivedPayments")
-  refunded_payments Payment[] @relation("RefundedPayments")
-}
-
-// ========================================
-// Update Order model (add payment relation)
-// ========================================
-model Order {
-  // ... existing fields ...
-  
-  payments Payment[]
+  @@index([restaurant_id])
+  @@index([restaurant_id, status])
+  @@map("bill_requests")
 }
 ```
 
 ---
 
-## 🔧 IMPLEMENTATION
+## 📁 CẤU TRÚC CODE HIỆN TẠI
 
-### **Step 1: Tạo Payments Module**
+```
+backend/src/
+├── bill-requests/                    # 🆕 MODULE MỚI (Phase 2)
+│   ├── bill-requests.module.ts       ✅ Đã tạo
+│   ├── bill-requests.controller.ts   ✅ Đã tạo
+│   ├── bill-requests.service.ts      ✅ Đã implement
+│   └── dto/
+│       ├── create-bill-request.dto.ts       ⏳ Cần tạo
+│       ├── accept-bill-request.dto.ts       ⏳ Cần tạo (optional)
+│       └── bill-request-response.dto.ts     ⏳ Cần tạo
+│
+├── payments/                         # 🔄 CẬP NHẬT (Phase 3, 5)
+│   ├── payments.module.ts            ✅ Đã có (có providers)
+│   ├── payments.controller.ts        ✅ Đã có
+│   ├── payments.service.ts           ❌ EMPTY - CẦN IMPLEMENT
+│   │
+│   ├── momo/
+│   │   └── momo.service.ts           ❌ EMPTY - CẦN IMPLEMENT
+│   ├── zalopay/
+│   │   └── zalopay.service.ts        ❌ EMPTY - CẦN IMPLEMENT
+│   ├── vnpay/
+│   │   └── vnpay.service.ts          ❌ EMPTY - CẦN IMPLEMENT
+│   ├── cash/
+│   │   └── cash.service.ts           ❌ EMPTY - CẦN IMPLEMENT
+│   │
+│   └── dto/
+│       ├── momo-callback.dto.ts      ⏳ Cần tạo
+│       ├── zalopay-callback.dto.ts   ⏳ Cần tạo
+│       ├── vnpay-ipn.dto.ts          ⏳ Cần tạo
+│       └── cash-confirm.dto.ts       ⏳ Cần tạo
+│
+└── notifications/                    # 🔄 CẬP NHẬT (Phase 4)
+    └── notifications.gateway.ts      ⏳ Thêm methods mới
+```
+
+### **🚨 SERVICES CẦN IMPLEMENT:**
+
+| Service             | File                         | Trạng thái | Priority    |
+| ------------------- | ---------------------------- | ---------- | ----------- |
+| **PaymentsService** | `payments.service.ts`        | ❌ Empty   | 🔴 Critical |
+| **MoMoService**     | `momo/momo.service.ts`       | ❌ Empty   | 🔴 Critical |
+| **ZaloPayService**  | `zalopay/zalopay.service.ts` | ❌ Empty   | 🟡 High     |
+| **VNPayService**    | `vnpay/vnpay.service.ts`     | ❌ Empty   | 🟡 High     |
+| **CashService**     | `cash/cash.service.ts`       | ❌ Empty   | 🟢 Medium   |
+
+---
+
+## 🔌 API ENDPOINTS
+
+### **1. Bill Request APIs (Customer)**
+
+```typescript
+// Customer tạo yêu cầu thanh toán
+POST /api/bill-requests
+Authorization: Bearer <customer_token> hoặc QR Session
+Body: {
+  table_id: "uuid",
+  payment_method: "momo" | "zalopay" | "vnpay" | "cash",
+  tips_amount: 50000,  // Optional
+  customer_note: "Cảm ơn!" // Optional
+}
+Response: {
+  id: "uuid",
+  subtotal: 350000,
+  tips_amount: 50000,
+  total_amount: 400000,
+  order_count: 3,
+  status: "pending",
+  message: "Yêu cầu đã được gửi. Vui lòng chờ waiter xác nhận."
+}
+
+// Customer xem trạng thái bill request
+GET /api/bill-requests/:id/status
+Response: {
+  id: "uuid",
+  status: "pending" | "accepted" | "completed" | "cancelled",
+  waiter_name: "Nguyễn Văn A",  // Nếu đã accept
+  accepted_at: "2026-01-13T10:30:00Z"
+}
+
+// Customer hủy bill request (chỉ khi status = pending)
+DELETE /api/bill-requests/:id
+```
+
+### **2. Bill Request APIs (Waiter)**
+
+```typescript
+// Waiter lấy danh sách bill requests của restaurant
+GET /api/bill-requests?status=pending
+Authorization: Bearer <waiter_token>
+Response: {
+  data: [
+    {
+      id: "uuid",
+      table_number: "5",
+      total_amount: 400000,
+      tips_amount: 50000,
+      payment_method: "momo",
+      order_count: 3,
+      customer_note: "Cảm ơn!",
+      created_at: "2026-01-13T10:25:00Z"
+    }
+  ]
+}
+
+// Waiter xem chi tiết bill request
+GET /api/bill-requests/:id
+Response: {
+  id: "uuid",
+  table: { id, table_number, location },
+  orders: [
+    { id, order_number, items: [...], subtotal: 150000 },
+    { id, order_number, items: [...], subtotal: 200000 }
+  ],
+  subtotal: 350000,
+  tips_amount: 50000,
+  total_amount: 400000,
+  payment_method: "momo",
+  status: "pending"
+}
+
+// Waiter accept bill request → Tạo payment + Generate QR
+POST /api/bill-requests/:id/accept
+Authorization: Bearer <waiter_token>
+Response: {
+  bill_request_id: "uuid",
+  payment_id: "uuid",
+  payment_method: "momo",
+  total_amount: 400000,
+
+  // Nếu MoMo/ZaloPay/VNPay:
+  qr_code_url: "https://...",      // URL ảnh QR
+  qr_code_data: "00020101...",     // Raw QR data
+  pay_url: "https://...",          // Deep link
+  expires_at: "2026-01-13T10:40:00Z",
+
+  // Nếu Cash:
+  awaiting_cash_confirmation: true
+}
+
+// Waiter reject/cancel bill request
+POST /api/bill-requests/:id/reject
+Body: { reason: "Bàn không có khách" }
+```
+
+### **3. Payment APIs (Callbacks)**
+
+```typescript
+// Gateway callbacks - KHÔNG ĐỔI
+POST /api/payments/momo/callback     // MoMo webhook
+POST /api/payments/zalopay/callback  // ZaloPay callback
+POST /api/payments/vnpay/ipn         // VNPay IPN
+
+// Cash confirmation - Waiter
+POST /api/payments/cash/confirm
+Authorization: Bearer <waiter_token>
+Body: {
+  payment_id: "uuid",
+  cash_received: 500000,
+  change_given: 100000,
+  notes: "Khách đưa 500k"
+}
+```
+
+---
+
+## 🔔 SOCKET.IO EVENTS
+
+### **Events mới cho Bill Request:**
+
+```typescript
+// ========================================
+// CUSTOMER → SERVER
+// ========================================
+
+// Customer tạo bill request (optional, có thể dùng REST API)
+socket.emit("bill_request:create", {
+  table_id: "uuid",
+  payment_method: "momo",
+  tips_amount: 50000,
+});
+
+// ========================================
+// SERVER → WAITER
+// ========================================
+
+// Khi customer tạo bill request
+socket.emit("bill_request:new", {
+  id: "uuid",
+  table_number: "5",
+  table_location: "Tầng 1 - Góc cửa sổ",
+  total_amount: 400000,
+  tips_amount: 50000,
+  payment_method: "momo",
+  order_count: 3,
+  customer_note: "Cảm ơn!",
+  created_at: "2026-01-13T10:25:00Z",
+});
+
+// ========================================
+// SERVER → CUSTOMER
+// ========================================
+
+// Khi waiter accept bill request
+socket.emit("bill_request:accepted", {
+  bill_request_id: "uuid",
+  waiter_name: "Nguyễn Văn A",
+  message: "Waiter đang xử lý thanh toán của bạn",
+});
+
+// Khi payment hoàn tất
+socket.emit("payment:completed", {
+  bill_request_id: "uuid",
+  payment_id: "uuid",
+  total_amount: 400000,
+  payment_method: "momo",
+  message: "Thanh toán thành công! Cảm ơn quý khách.",
+});
+
+// ========================================
+// SERVER → ADMIN
+// ========================================
+
+// Payment completed notification
+socket.emit("payment:received", {
+  table_number: "5",
+  amount: 400000,
+  tips: 50000,
+  method: "MoMo",
+  waiter: "Nguyễn Văn A",
+});
+```
+
+---
+
+## 📝 DTOs CHI TIẾT
+
+### **1. create-bill-request.dto.ts**
+
+```typescript
+import {
+  IsUUID,
+  IsString,
+  IsIn,
+  IsNumber,
+  IsOptional,
+  Min,
+} from "class-validator";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+
+export class CreateBillRequestDto {
+  @ApiProperty({ description: "ID của bàn" })
+  @IsUUID()
+  table_id: string;
+
+  @ApiProperty({
+    description: "Phương thức thanh toán",
+    enum: ["momo", "zalopay", "vnpay", "cash"],
+  })
+  @IsString()
+  @IsIn(["momo", "zalopay", "vnpay", "cash"])
+  payment_method: string;
+
+  @ApiPropertyOptional({ description: "Tiền tips (VND)", default: 0 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  tips_amount?: number = 0;
+
+  @ApiPropertyOptional({ description: "Ghi chú của khách" })
+  @IsOptional()
+  @IsString()
+  customer_note?: string;
+}
+```
+
+### **2. accept-bill-request.dto.ts**
+
+```typescript
+import { IsUUID } from "class-validator";
+import { ApiProperty } from "@nestjs/swagger";
+
+export class AcceptBillRequestDto {
+  @ApiProperty({ description: "ID của bill request" })
+  @IsUUID()
+  bill_request_id: string;
+}
+```
+
+### **3. bill-request-response.dto.ts**
+
+```typescript
+import { ApiProperty } from "@nestjs/swagger";
+
+export class BillRequestResponseDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  table_number: string;
+
+  @ApiProperty()
+  subtotal: number;
+
+  @ApiProperty()
+  tips_amount: number;
+
+  @ApiProperty()
+  total_amount: number;
+
+  @ApiProperty()
+  order_count: number;
+
+  @ApiProperty()
+  payment_method: string;
+
+  @ApiProperty()
+  status: "pending" | "accepted" | "completed" | "cancelled";
+
+  @ApiProperty()
+  customer_note?: string;
+
+  @ApiProperty()
+  created_at: Date;
+}
+
+export class AcceptBillRequestResponseDto {
+  @ApiProperty()
+  bill_request_id: string;
+
+  @ApiProperty()
+  payment_id: string;
+
+  @ApiProperty()
+  payment_method: string;
+
+  @ApiProperty()
+  total_amount: number;
+
+  // For online payments
+  @ApiProperty({ required: false })
+  qr_code_url?: string;
+
+  @ApiProperty({ required: false })
+  qr_code_data?: string;
+
+  @ApiProperty({ required: false })
+  pay_url?: string;
+
+  @ApiProperty({ required: false })
+  expires_at?: Date;
+
+  // For cash
+  @ApiProperty({ required: false })
+  awaiting_cash_confirmation?: boolean;
+}
+```
+
+---
+
+## 🔧 SERVICE LOGIC
+
+### **BillRequestsService - Core Logic**
+
+```typescript
+// bill-requests.service.ts
+
+@Injectable()
+export class BillRequestsService {
+  constructor(
+    private prisma: PrismaService,
+    private paymentsService: PaymentsService,
+    private notificationsGateway: NotificationsGateway
+  ) {}
+
+  /**
+   * Customer tạo bill request
+   * Query TỐI ƯU - Chỉ lấy orders chưa thanh toán
+   */
+  async createBillRequest(dto: CreateBillRequestDto, customerId?: string) {
+    // ⚡ QUERY TỐI ƯU: Dùng WHERE clause, không fetch all rồi filter
+    const unpaidOrders = await this.prisma.order.findMany({
+      where: {
+        table_id: dto.table_id,
+        status: { in: ["pending", "accepted", "preparing", "ready", "served"] },
+        // KHÔNG lấy completed, cancelled, rejected
+      },
+      select: {
+        id: true,
+        order_number: true,
+        total: true,
+        status: true,
+      },
+      orderBy: { created_at: "asc" },
+    });
+
+    if (unpaidOrders.length === 0) {
+      throw new BadRequestException("Không có order nào cần thanh toán");
+    }
+
+    // Kiểm tra xem có bill request pending nào không
+    const existingRequest = await this.prisma.billRequest.findFirst({
+      where: {
+        table_id: dto.table_id,
+        status: "pending",
+      },
+    });
+
+    if (existingRequest) {
+      throw new BadRequestException("Đã có yêu cầu thanh toán đang chờ xử lý");
+    }
+
+    // Tính tổng tiền
+    const subtotal = unpaidOrders.reduce(
+      (sum, order) => sum + Number(order.total),
+      0
+    );
+    const tipsAmount = dto.tips_amount || 0;
+    const totalAmount = subtotal + tipsAmount;
+
+    // Lấy restaurant_id từ table
+    const table = await this.prisma.table.findUnique({
+      where: { id: dto.table_id },
+      select: { restaurant_id: true, table_number: true },
+    });
+
+    // Tạo bill request
+    const billRequest = await this.prisma.billRequest.create({
+      data: {
+        restaurant_id: table.restaurant_id,
+        table_id: dto.table_id,
+        payment_method_code: dto.payment_method,
+        subtotal,
+        tips_amount: tipsAmount,
+        total_amount: totalAmount,
+        order_ids: unpaidOrders.map((o) => o.id), // JSON array
+        customer_note: dto.customer_note,
+        status: "pending",
+      },
+    });
+
+    // 🔔 Notify waiters của restaurant này
+    this.notificationsGateway.notifyWaiters(
+      table.restaurant_id,
+      "bill_request:new",
+      {
+        id: billRequest.id,
+        table_number: table.table_number,
+        total_amount: totalAmount,
+        tips_amount: tipsAmount,
+        payment_method: dto.payment_method,
+        order_count: unpaidOrders.length,
+        customer_note: dto.customer_note,
+        created_at: billRequest.created_at,
+      }
+    );
+
+    return {
+      id: billRequest.id,
+      subtotal,
+      tips_amount: tipsAmount,
+      total_amount: totalAmount,
+      order_count: unpaidOrders.length,
+      status: "pending",
+      message: "Yêu cầu đã được gửi. Vui lòng chờ waiter xác nhận.",
+    };
+  }
+
+  /**
+   * Waiter accept bill request → Generate payment + QR
+   */
+  async acceptBillRequest(billRequestId: string, waiterId: string) {
+    const billRequest = await this.prisma.billRequest.findUnique({
+      where: { id: billRequestId },
+      include: { table: true },
+    });
+
+    if (!billRequest) {
+      throw new NotFoundException("Bill request không tồn tại");
+    }
+
+    if (billRequest.status !== "pending") {
+      throw new BadRequestException("Bill request đã được xử lý");
+    }
+
+    // Update bill request status
+    await this.prisma.billRequest.update({
+      where: { id: billRequestId },
+      data: {
+        status: "accepted",
+        accepted_by: waiterId,
+        accepted_at: new Date(),
+      },
+    });
+
+    // Tạo payment và generate QR (nếu online payment)
+    const paymentResult =
+      await this.paymentsService.initiatePaymentFromBillRequest({
+        bill_request_id: billRequestId,
+        payment_method: billRequest.payment_method_code,
+        amount: Number(billRequest.total_amount),
+        tips_amount: Number(billRequest.tips_amount),
+        order_ids: billRequest.order_ids as string[],
+      });
+
+    // 🔔 Notify customer
+    this.notificationsGateway.notifyTable(
+      billRequest.table_id,
+      "bill_request:accepted",
+      {
+        bill_request_id: billRequestId,
+        waiter_name: "Waiter", // TODO: Get waiter name
+        message: "Waiter đang xử lý thanh toán của bạn",
+      }
+    );
+
+    return {
+      bill_request_id: billRequestId,
+      payment_id: paymentResult.payment_id,
+      payment_method: billRequest.payment_method_code,
+      total_amount: Number(billRequest.total_amount),
+      ...paymentResult, // QR code, pay_url, etc.
+    };
+  }
+}
+```
+
+---
+
+## 🔨 IMPLEMENTATION CHI TIẾT - TỪNG BƯỚC
+
+---
+
+## ✅ PHASE 1: DATABASE MIGRATION (2h)
+
+### **Bước 1.1: Cập nhật Prisma Schema**
+
+**File:** `backend/prisma/schema.prisma`
+
+**Tìm model `Payment` (dòng ~340) và thêm 3 fields mới:**
+
+```prisma
+model payments {
+  id                                String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  order_id                          String?         @db.Uuid  // ⬅️ ĐỔI: Thêm ? để nullable
+  payment_method_id                 String          @db.Uuid
+  amount                            Decimal         @db.Decimal(10, 2)
+
+  // 🆕 THÊM 3 FIELDS MỚI
+  bill_request_id                   String?         @db.Uuid
+  merged_order_ids                  Json?           // Array of order UUIDs
+  tips_amount                       Decimal?        @default(0) @db.Decimal(10, 2)
+
+  // ... các fields khác giữ nguyên
+  status                            String?         @default("pending") @db.VarChar(20)
+  gateway_request_id                String?         @db.VarChar(100)
+  // ... rest of fields
+}
+```
+
+**Tìm model `Table` và thêm relation:**
+
+```prisma
+model Table {
+  id                  String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // ... existing fields
+  orders              Order[]
+  bill_requests       BillRequest[] // 🆕 THÊM relation
+  restaurant          Restaurant    @relation(fields: [restaurant_id], references: [id], onDelete: Cascade)
+
+  @@map("tables")
+}
+```
+
+**Tìm model `Restaurant` và thêm relation:**
+
+```prisma
+model Restaurant {
+  id              String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // ... existing fields
+  menu_categories MenuCategory[]
+  modifier_groups ModifierGroup[]
+  tables          Table[]
+  bill_requests   BillRequest[]   // 🆕 THÊM relation
+
+  @@map("restaurants")
+}
+```
+
+**Tìm model `User` và thêm relation:**
+
+```prisma
+model User {
+  id                                   String          @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  // ... existing fields
+  notifications                        notifications[]
+  payments_payments_received_byTousers payments[]      @relation("payments_received_byTousers")
+  payments_payments_refunded_byTousers payments[]      @relation("payments_refunded_byTousers")
+  restaurants                          Restaurant[]
+  user_roles                           UserRole[]
+  bill_requests                        BillRequest[]   // 🆕 THÊM relation
+
+  @@map("users")
+}
+```
+
+**Thêm model `BillRequest` MỚI (ở cuối file, trước enum):**
+
+```prisma
+model BillRequest {
+  id                  String      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  restaurant_id       String      @db.Uuid
+  table_id            String      @db.Uuid
+  payment_method_code String      @db.VarChar(20)
+  subtotal            Decimal     @db.Decimal(12, 2)
+  tips_amount         Decimal     @default(0) @db.Decimal(12, 2)
+  total_amount        Decimal     @db.Decimal(12, 2)
+  order_ids           Json        // Array of order UUIDs
+  customer_note       String?
+  status              String      @default("pending") @db.VarChar(20)
+  accepted_by         String?     @db.Uuid
+  accepted_at         DateTime?   @db.Timestamp(6)
+  created_at          DateTime    @default(now()) @db.Timestamp(6)
+  updated_at          DateTime    @updatedAt @db.Timestamp(6)
+
+  restaurant          Restaurant  @relation(fields: [restaurant_id], references: [id], onDelete: Cascade)
+  table               Table       @relation(fields: [table_id], references: [id], onDelete: Cascade)
+  waiter              User?       @relation(fields: [accepted_by], references: [id])
+
+  @@index([table_id])
+  @@index([status])
+  @@index([restaurant_id])
+  @@index([restaurant_id, status])
+  @@map("bill_requests")
+}
+```
+
+**Tác dụng:**
+
+- `BillRequest`: Model mới lưu thông tin customer request bill
+- `bill_request_id` trong `payments`: Liên kết payment với bill request
+- `merged_order_ids`: Backup list các order IDs được gộp
+- `tips_amount`: Lưu tiền tips riêng
+
+---
+
+### **Bước 1.2: Tạo Migration**
+
+**Terminal:**
+
+```bash
+cd backend
+
+# Tạo migration từ schema changes
+npx prisma migrate dev --name add_bill_requests_table
+
+# Nếu có lỗi, xem log và fix
+# Output mong đợi: "Migration applied successfully"
+```
+
+**Nếu thành công, sẽ tạo file:**
+`backend/prisma/migrations/YYYYMMDDHHMMSS_add_bill_requests_table/migration.sql`
+
+**Tác dụng:**
+
+- Tạo bảng `bill_requests` trong database
+- Thêm 3 columns mới vào bảng `payments`
+- Tạo indexes để query nhanh
+
+---
+
+### **Bước 1.3: Generate Prisma Client**
+
+**Terminal:**
+
+```bash
+npx prisma generate
+```
+
+**Tác dụng:**
+
+- Update Prisma Client với model mới
+- Cho phép code TypeScript dùng `prisma.billRequest`
+- Thêm type definitions cho TypeScript
+
+---
+
+### **Bước 1.4: Kiểm tra Migration**
+
+**Terminal:**
+
+```bash
+# Xem các bảng trong database
+npx prisma studio
+```
+
+**Kiểm tra:**
+
+1. Mở Prisma Studio (http://localhost:5555)
+2. Kiểm tra bảng `bill_requests` đã xuất hiện
+3. Kiểm tra bảng `payments` có 3 columns mới
+
+---
+
+### **✅ CHECKLIST PHASE 1**
+
+```
+□ Update schema.prisma - Thêm model BillRequest
+□ Update schema.prisma - Thêm 3 fields vào payments
+□ Update schema.prisma - Thêm relations vào Table, Restaurant, User
+□ Run: npx prisma migrate dev --name add_bill_requests_table
+□ Run: npx prisma generate
+□ Test: npx prisma studio → Xem bảng bill_requests
+□ Commit: git add . && git commit -m "feat(db): add bill_requests table for batch payment"
+```
+
+---
+
+## ✅ PHASE 2: BILL REQUESTS MODULE (4h)
+
+### **Bước 2.1: Tạo Module Structure**
+
+**Terminal:**
 
 ```bash
 cd backend/src
 
-# Create module structure
-nest g module payments
-nest g controller payments
-nest g service payments
+# Tạo module, controller, service
+nest g module bill-requests
+nest g controller bill-requests --no-spec
+nest g service bill-requests --no-spec
 
-# Create gateway services
-nest g service payments/momo
-nest g service payments/zalopay
-nest g service payments/vnpay
-nest g service payments/cash
+# Tạo thư mục DTOs
+mkdir -p bill-requests/dto
 ```
 
-**Files created:**
-- `backend/src/payments/payments.module.ts`
-- `backend/src/payments/payments.controller.ts`
-- `backend/src/payments/payments.service.ts`
-- `backend/src/payments/momo.service.ts`
-- `backend/src/payments/zalopay.service.ts`
-- `backend/src/payments/vnpay.service.ts`
-- `backend/src/payments/cash.service.ts`
+**Files được tạo:**
+
+- `src/bill-requests/bill-requests.module.ts`
+- `src/bill-requests/bill-requests.controller.ts`
+- `src/bill-requests/bill-requests.service.ts`
+- `src/bill-requests/dto/` (folder)
+
+**Tác dụng:**
+
+- Module quản lý tất cả logic bill requests
+- Controller xử lý HTTP requests
+- Service chứa business logic
 
 ---
 
-### **Step 2: Tạo DTOs**
+### **Bước 2.2: Tạo DTOs**
 
-#### **File:** `backend/src/payments/dto/create-payment.dto.ts`
+#### **File 1:** `src/bill-requests/dto/create-bill-request.dto.ts`
 
 ```typescript
-import { IsUUID, IsString, IsOptional, IsIn } from 'class-validator';
+import {
+  IsUUID,
+  IsString,
+  IsIn,
+  IsNumber,
+  IsOptional,
+  Min,
+} from "class-validator";
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
 
-export class CreatePaymentDto {
+export class CreateBillRequestDto {
+  @ApiProperty({
+    description: "ID của bàn",
+    example: "123e4567-e89b-12d3-a456-426614174000",
+  })
   @IsUUID()
-  order_id: string;
+  table_id: string;
 
+  @ApiProperty({
+    description: "Phương thức thanh toán",
+    enum: ["momo", "zalopay", "vnpay", "cash"],
+    example: "momo",
+  })
   @IsString()
-  @IsIn(['momo', 'zalopay', 'vnpay', 'cash'])
-  method: string; // Required: select payment method
+  @IsIn(["momo", "zalopay", "vnpay", "cash"])
+  payment_method: string;
 
-  @IsString()
+  @ApiPropertyOptional({
+    description: "Tiền tips (VND)",
+    default: 0,
+    example: 50000,
+  })
   @IsOptional()
-  return_url?: string; // URL to redirect after payment (for online methods)
+  @IsNumber()
+  @Min(0)
+  tips_amount?: number = 0;
+
+  @ApiPropertyOptional({
+    description: "Ghi chú của khách",
+    example: "Cảm ơn nhà hàng!",
+  })
+  @IsOptional()
+  @IsString()
+  customer_note?: string;
 }
 ```
 
-#### **File:** `backend/src/payments/dto/momo-callback.dto.ts`
+**Tác dụng:** Validate request body từ customer khi tạo bill request
+
+---
+
+#### **File 2:** `src/bill-requests/dto/bill-request-response.dto.ts`
 
 ```typescript
-export class MoMoCallbackDto {
-  partnerCode: string;
-  orderId: string; // Our payment ID
+import { ApiProperty, ApiPropertyOptional } from "@nestjs/swagger";
+
+export class BillRequestResponseDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  table_number: string;
+
+  @ApiProperty({ example: 350000 })
+  subtotal: number;
+
+  @ApiProperty({ example: 50000 })
+  tips_amount: number;
+
+  @ApiProperty({ example: 400000 })
+  total_amount: number;
+
+  @ApiProperty({ example: 3 })
+  order_count: number;
+
+  @ApiProperty({ example: "momo" })
+  payment_method: string;
+
+  @ApiProperty({ enum: ["pending", "accepted", "completed", "cancelled"] })
+  status: "pending" | "accepted" | "completed" | "cancelled";
+
+  @ApiPropertyOptional()
+  customer_note?: string;
+
+  @ApiProperty()
+  created_at: Date;
+}
+
+export class AcceptBillRequestResponseDto {
+  @ApiProperty()
+  bill_request_id: string;
+
+  @ApiProperty()
+  payment_id: string;
+
+  @ApiProperty()
+  payment_method: string;
+
+  @ApiProperty({ example: 400000 })
+  total_amount: number;
+
+  // For online payments (MoMo/ZaloPay/VNPay)
+  @ApiPropertyOptional({
+    description: "URL của ảnh QR code",
+    example: "https://api.vietqr.io/image/...",
+  })
+  qr_code_url?: string;
+
+  @ApiPropertyOptional({
+    description: "Raw QR code data (EMVCo format)",
+    example:
+      "00020101021238570010A00000072701270006970436011599988800208QRIBFTTA53037045802VN...",
+  })
+  qr_code_data?: string;
+
+  @ApiPropertyOptional({
+    description: "Deep link để mở app",
+    example: "momo://app?action=pay&amount=400000",
+  })
+  pay_url?: string;
+
+  @ApiPropertyOptional()
+  expires_at?: Date;
+
+  // For cash payment
+  @ApiPropertyOptional({
+    description: "True nếu đang chờ waiter confirm cash",
+    example: true,
+  })
+  awaiting_cash_confirmation?: boolean;
+}
+```
+
+**Tác dụng:** Define response format cho API responses
+
+---
+
+### **Bước 2.3: Implement Service**
+
+**File:** `src/bill-requests/bill-requests.service.ts`
+
+```typescript
+import {
+  Injectable,
+  BadRequestException,
+  NotFoundException,
+} from "@nestjs/common";
+import { PrismaService } from "../prisma/prisma.service";
+import { CreateBillRequestDto } from "./dto/create-bill-request.dto";
+
+@Injectable()
+export class BillRequestsService {
+  constructor(private prisma: PrismaService) {}
+
+  /**
+   * Customer tạo bill request
+   * Tác dụng: Gộp tất cả orders chưa thanh toán của bàn → tạo 1 bill request
+   */
+  async createBillRequest(dto: CreateBillRequestDto, customerId?: string) {
+    // 1. Query orders chưa thanh toán (OPTIMIZED)
+    const unpaidOrders = await this.prisma.order.findMany({
+      where: {
+        table_id: dto.table_id,
+        status: { in: ["pending", "accepted", "preparing", "ready", "served"] },
+      },
+      select: {
+        id: true,
+        order_number: true,
+        total: true,
+        status: true,
+      },
+      orderBy: { created_at: "asc" },
+    });
+
+    if (unpaidOrders.length === 0) {
+      throw new BadRequestException("Không có order nào cần thanh toán");
+    }
+
+    // 2. Kiểm tra có bill request pending khác không
+    const existingRequest = await this.prisma.billRequest.findFirst({
+      where: {
+        table_id: dto.table_id,
+        status: "pending",
+      },
+    });
+
+    if (existingRequest) {
+      throw new BadRequestException("Đã có yêu cầu thanh toán đang chờ xử lý");
+    }
+
+    // 3. Tính tổng tiền
+    const subtotal = unpaidOrders.reduce(
+      (sum, order) => sum + Number(order.total),
+      0
+    );
+    const tipsAmount = dto.tips_amount || 0;
+    const totalAmount = subtotal + tipsAmount;
+
+    // 4. Lấy thông tin table và restaurant
+    const table = await this.prisma.table.findUnique({
+      where: { id: dto.table_id },
+      select: { restaurant_id: true, table_number: true, location: true },
+    });
+
+    if (!table) {
+      throw new NotFoundException("Bàn không tồn tại");
+    }
+
+    // 5. Tạo bill request trong database
+    const billRequest = await this.prisma.billRequest.create({
+      data: {
+        restaurant_id: table.restaurant_id,
+        table_id: dto.table_id,
+        payment_method_code: dto.payment_method,
+        subtotal,
+        tips_amount: tipsAmount,
+        total_amount: totalAmount,
+        order_ids: unpaidOrders.map((o) => o.id), // JSON array
+        customer_note: dto.customer_note,
+        status: "pending",
+      },
+    });
+
+    // 6. TODO: Notify waiters qua Socket.IO (Phase 4)
+
+    // 7. Return response
+    return {
+      id: billRequest.id,
+      subtotal,
+      tips_amount: tipsAmount,
+      total_amount: totalAmount,
+      order_count: unpaidOrders.length,
+      status: "pending",
+      message: "Yêu cầu đã được gửi. Vui lòng chờ waiter xác nhận.",
+    };
+  }
+
+  /**
+   * Waiter lấy danh sách bill requests của restaurant
+   */
+  async getBillRequestsByRestaurant(restaurantId: string, status?: string) {
+    const where: any = { restaurant_id: restaurantId };
+    if (status) {
+      where.status = status;
+    }
+
+    const billRequests = await this.prisma.billRequest.findMany({
+      where,
+      include: {
+        table: {
+          select: {
+            table_number: true,
+            location: true,
+          },
+        },
+      },
+      orderBy: { created_at: "desc" },
+    });
+
+    return billRequests.map((br) => ({
+      id: br.id,
+      table_number: br.table.table_number,
+      table_location: br.table.location,
+      total_amount: Number(br.total_amount),
+      tips_amount: Number(br.tips_amount),
+      payment_method: br.payment_method_code,
+      order_count: (br.order_ids as string[]).length,
+      customer_note: br.customer_note,
+      status: br.status,
+      created_at: br.created_at,
+    }));
+  }
+
+  /**
+   * Lấy chi tiết 1 bill request
+   */
+  async getBillRequestById(id: string) {
+    const billRequest = await this.prisma.billRequest.findUnique({
+      where: { id },
+      include: {
+        table: {
+          select: {
+            id: true,
+            table_number: true,
+            location: true,
+          },
+        },
+        waiter: {
+          select: {
+            id: true,
+            full_name: true,
+          },
+        },
+      },
+    });
+
+    if (!billRequest) {
+      throw new NotFoundException("Bill request không tồn tại");
+    }
+
+    // Lấy chi tiết các orders
+    const orderIds = billRequest.order_ids as string[];
+    const orders = await this.prisma.order.findMany({
+      where: {
+        id: { in: orderIds },
+      },
+      include: {
+        order_items: {
+          include: {
+            menu_item: {
+              select: {
+                name: true,
+                price: true,
+              },
+            },
+          },
+        },
+      },
+    });
+
+    return {
+      id: billRequest.id,
+      table: billRequest.table,
+      orders: orders.map((o) => ({
+        id: o.id,
+        order_number: o.order_number,
+        items: o.order_items,
+        subtotal: Number(o.total),
+      })),
+      subtotal: Number(billRequest.subtotal),
+      tips_amount: Number(billRequest.tips_amount),
+      total_amount: Number(billRequest.total_amount),
+      payment_method: billRequest.payment_method_code,
+      customer_note: billRequest.customer_note,
+      status: billRequest.status,
+      waiter: billRequest.waiter,
+      created_at: billRequest.created_at,
+      accepted_at: billRequest.accepted_at,
+    };
+  }
+
+  /**
+   * Waiter accept bill request
+   * TODO: Phase 3 - Integrate với PaymentsService
+   */
+  async acceptBillRequest(billRequestId: string, waiterId: string) {
+    const billRequest = await this.prisma.billRequest.findUnique({
+      where: { id: billRequestId },
+      include: { table: true },
+    });
+
+    if (!billRequest) {
+      throw new NotFoundException("Bill request không tồn tại");
+    }
+
+    if (billRequest.status !== "pending") {
+      throw new BadRequestException("Bill request đã được xử lý");
+    }
+
+    // Update status
+    await this.prisma.billRequest.update({
+      where: { id: billRequestId },
+      data: {
+        status: "accepted",
+        accepted_by: waiterId,
+        accepted_at: new Date(),
+      },
+    });
+
+    // TODO: Phase 3 - Call PaymentsService.initiatePaymentFromBillRequest()
+
+    return {
+      bill_request_id: billRequestId,
+      message: "Bill request đã được chấp nhận",
+    };
+  }
+
+  /**
+   * Cancel/Reject bill request
+   */
+  async cancelBillRequest(id: string, reason?: string) {
+    const billRequest = await this.prisma.billRequest.findUnique({
+      where: { id },
+    });
+
+    if (!billRequest) {
+      throw new NotFoundException("Bill request không tồn tại");
+    }
+
+    if (billRequest.status !== "pending") {
+      throw new BadRequestException("Không thể hủy bill request đã được xử lý");
+    }
+
+    await this.prisma.billRequest.update({
+      where: { id },
+      data: {
+        status: "cancelled",
+        customer_note: reason
+          ? `${billRequest.customer_note}\nLý do hủy: ${reason}`
+          : billRequest.customer_note,
+      },
+    });
+
+    return { message: "Bill request đã bị hủy" };
+  }
+}
+```
+
+**Tác dụng:** Chứa toàn bộ business logic cho bill requests
+
+---
+
+### **Bước 2.4: Implement Controller**
+
+**File:** `src/bill-requests/bill-requests.controller.ts`
+
+```typescript
+import {
+  Controller,
+  Get,
+  Post,
+  Delete,
+  Body,
+  Param,
+  Query,
+  UseGuards,
+  Request,
+} from "@nestjs/common";
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+} from "@nestjs/swagger";
+import { BillRequestsService } from "./bill-requests.service";
+import { CreateBillRequestDto } from "./dto/create-bill-request.dto";
+import {
+  BillRequestResponseDto,
+  AcceptBillRequestResponseDto,
+} from "./dto/bill-request-response.dto";
+import { JwtAuthGuard } from "../auth/guards/jwt-auth.guard";
+import { RolesGuard } from "../auth/guards/roles.guard";
+import { Roles } from "../auth/decorators/roles.decorator";
+
+@ApiTags("Bill Requests")
+@Controller("bill-requests")
+export class BillRequestsController {
+  constructor(private readonly billRequestsService: BillRequestsService) {}
+
+  @Post()
+  @ApiOperation({
+    summary: "Tạo bill request (Customer)",
+    description: 'Customer bấm "Request Bill" để yêu cầu thanh toán',
+  })
+  @ApiResponse({ status: 201, type: BillRequestResponseDto })
+  async create(@Body() dto: CreateBillRequestDto) {
+    return this.billRequestsService.createBillRequest(dto);
+  }
+
+  @Get()
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles("waiter", "admin")
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Lấy danh sách bill requests (Waiter)",
+    description: "Waiter xem tất cả bill requests của restaurant",
+  })
+  async findAll(@Request() req, @Query("status") status?: string) {
+    // TODO: Get restaurant_id from user
+    const restaurantId = "xxx"; // Placeholder
+    return this.billRequestsService.getBillRequestsByRestaurant(
+      restaurantId,
+      status
+    );
+  }
+
+  @Get(":id")
+  @ApiOperation({ summary: "Xem chi tiết bill request" })
+  async findOne(@Param("id") id: string) {
+    return this.billRequestsService.getBillRequestById(id);
+  }
+
+  @Get(":id/status")
+  @ApiOperation({
+    summary: "Kiểm tra trạng thái bill request (Customer)",
+    description: "Customer polling để xem waiter đã accept chưa",
+  })
+  async getStatus(@Param("id") id: string) {
+    const billRequest = await this.billRequestsService.getBillRequestById(id);
+    return {
+      id: billRequest.id,
+      status: billRequest.status,
+      waiter_name: billRequest.waiter?.full_name,
+      accepted_at: billRequest.accepted_at,
+    };
+  }
+
+  @Post(":id/accept")
+  @UseGuards(JwtAuthGuard, RolesGuard)
+  @Roles("waiter")
+  @ApiBearerAuth()
+  @ApiOperation({
+    summary: "Accept bill request (Waiter)",
+    description: "Waiter chấp nhận và tạo payment",
+  })
+  @ApiResponse({ status: 200, type: AcceptBillRequestResponseDto })
+  async accept(@Param("id") id: string, @Request() req) {
+    return this.billRequestsService.acceptBillRequest(id, req.user.userId);
+  }
+
+  @Delete(":id")
+  @ApiOperation({ summary: "Hủy bill request" })
+  async cancel(@Param("id") id: string, @Body("reason") reason?: string) {
+    return this.billRequestsService.cancelBillRequest(id, reason);
+  }
+}
+```
+
+**Tác dụng:** Định nghĩa HTTP endpoints và routing
+
+---
+
+### **Bước 2.5: Update Module**
+
+**File:** `src/bill-requests/bill-requests.module.ts`
+
+```typescript
+import { Module } from "@nestjs/common";
+import { BillRequestsController } from "./bill-requests.controller";
+import { BillRequestsService } from "./bill-requests.service";
+import { PrismaModule } from "../prisma/prisma.module";
+
+@Module({
+  imports: [PrismaModule],
+  controllers: [BillRequestsController],
+  providers: [BillRequestsService],
+  exports: [BillRequestsService], // Export để PaymentsModule dùng
+})
+export class BillRequestsModule {}
+```
+
+---
+
+### **Bước 2.6: Register Module trong AppModule**
+
+**File:** `src/app.module.ts`
+
+```typescript
+import { BillRequestsModule } from "./bill-requests/bill-requests.module";
+
+@Module({
+  imports: [
+    // ... existing modules
+    BillRequestsModule, // 🆕 THÊM dòng này
+  ],
+  // ...
+})
+export class AppModule {}
+```
+
+**Tác dụng:** Đăng ký module với NestJS
+
+---
+
+### **✅ CHECKLIST PHASE 2**
+
+```
+□ Run: nest g module bill-requests
+□ Run: nest g controller bill-requests --no-spec
+□ Run: nest g service bill-requests --no-spec
+□ Run: mkdir -p src/bill-requests/dto
+□ Create: create-bill-request.dto.ts
+□ Create: bill-request-response.dto.ts
+□ Implement: bill-requests.service.ts (5 methods)
+□ Implement: bill-requests.controller.ts (6 endpoints)
+□ Update: bill-requests.module.ts (import PrismaModule)
+□ Update: app.module.ts (import BillRequestsModule)
+□ Test: npm run start:dev → Không có lỗi
+□ Test: GET http://localhost:3000/bill-requests → API hoạt động
+□ Commit: git add . && git commit -m "feat(bill-requests): implement bill request module"
+```
+
+---
+
+## ⚙️ PHASE 3: PAYMENTS SERVICE - CHI TIẾT IMPLEMENTATION
+
+### **🚨 TÌNH TRẠNG HIỆN TẠI:**
+
+**Các services sau đã TỒN TẠI file nhưng đều EMPTY (chỉ có class declaration):**
+
+| Service             | File                                      | Trạng thái               |
+| ------------------- | ----------------------------------------- | ------------------------ |
+| **PaymentsService** | `src/payments/payments.service.ts`        | ❌ Empty - Cần implement |
+| **MoMoService**     | `src/payments/momo/momo.service.ts`       | ❌ Empty - Cần implement |
+| **ZaloPayService**  | `src/payments/zalopay/zalopay.service.ts` | ❌ Empty - Cần implement |
+| **VNPayService**    | `src/payments/vnpay/vnpay.service.ts`     | ❌ Empty - Cần implement |
+| **CashService**     | `src/payments/cash/cash.service.ts`       | ❌ Empty - Cần implement |
+
+**Module đã được cấu hình đúng:**
+
+- ✅ `payments.module.ts` đã import và provide tất cả 4 gateway services
+- ✅ `payments.controller.ts` đã có sẵn
+- ✅ Folder structure: `momo/`, `zalopay/`, `vnpay/`, `cash/`
+
+---
+
+### **📋 BƯỚC 3.1: PaymentsService - Core Implementation**
+
+**File:** `src/payments/payments.service.ts`
+
+#### **Thêm imports và constructor:**
+
+```typescript
+import { Injectable, NotFoundException, BadRequestException } from '@nestjs/common';
+import { PrismaService } from '../prisma/prisma.service';
+import { MomoService } from './momo/momo.service';
+import { ZaloPayService } from './zalopay/zalopay.service';
+import { VnPayService } from './vnpay/vnpay.service';
+import { CashService } from './cash/cash.service';
+
+@Injectable()
+export class PaymentsService {
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly momoService: MomoService,
+    private readonly zalopayService: ZaloPayService,
+    private readonly vnpayService: VnPayService,
+    private readonly cashService: CashService,
+  ) {}
+```
+
+#### **Method 1: `initiatePaymentFromBillRequest()` - TẠO PAYMENT TỪ BILL REQUEST**
+
+```typescript
+/**
+ * Khởi tạo payment từ bill request (được gọi khi waiter accept)
+ */
+async initiatePaymentFromBillRequest(dto: {
+  bill_request_id: string;
+  payment_method: string;
+  amount: number;
+  tips_amount: number;
+  order_ids: string[];
+  restaurant_id: string;
+}) {
+  const { bill_request_id, payment_method, amount, tips_amount, order_ids, restaurant_id } = dto;
+
+  // 1. Validate bill request
+  const billRequest = await this.prisma.bill_requests.findUnique({
+    where: { id: bill_request_id },
+  });
+
+  if (!billRequest) {
+    throw new NotFoundException('Bill request not found');
+  }
+
+  if (billRequest.status !== 'accepted') {
+    throw new BadRequestException('Bill request must be accepted before payment');
+  }
+
+  // 2. Lấy payment method từ DB
+  const paymentMethod = await this.prisma.payment_methods.findFirst({
+    where: {
+      name: payment_method,
+      restaurant_id: restaurant_id,
+      is_active: true,
+    },
+  });
+
+  if (!paymentMethod) {
+    throw new NotFoundException(`Payment method ${payment_method} not found or inactive`);
+  }
+
+  // 3. Tạo payment record
+  const payment = await this.prisma.payments.create({
+    data: {
+      bill_request_id,
+      payment_method_id: paymentMethod.id,
+      amount,
+      tips_amount,
+      total_amount: amount + tips_amount,
+      status: 'pending',
+      transaction_id: null, // Sẽ được update khi gateway response
+      qr_code: null,
+      expires_at: new Date(Date.now() + 15 * 60 * 1000), // 15 phút
+    },
+  });
+
+  // 4. Gọi gateway service tương ứng
+  let gatewayResponse;
+
+  switch (payment_method.toLowerCase()) {
+    case 'momo':
+      gatewayResponse = await this.momoService.createPayment({
+        payment_id: payment.id,
+        amount: payment.total_amount,
+        order_info: `Payment for ${order_ids.length} orders`,
+        restaurant_id,
+      });
+      break;
+
+    case 'zalopay':
+      gatewayResponse = await this.zalopayService.createOrder({
+        payment_id: payment.id,
+        amount: payment.total_amount,
+        description: `Bill payment - ${order_ids.length} orders`,
+        restaurant_id,
+      });
+      break;
+
+    case 'vnpay':
+      gatewayResponse = await this.vnpayService.createPaymentUrl({
+        payment_id: payment.id,
+        amount: payment.total_amount,
+        order_info: `Bill ${bill_request_id}`,
+        restaurant_id,
+      });
+      break;
+
+    case 'cash':
+      gatewayResponse = await this.cashService.createCashPayment({
+        payment_id: payment.id,
+        amount: payment.total_amount,
+      });
+      break;
+
+    default:
+      throw new BadRequestException(`Unsupported payment method: ${payment_method}`);
+  }
+
+  // 5. Update payment với transaction_id và QR code
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      transaction_id: gatewayResponse.transaction_id,
+      qr_code: gatewayResponse.qr_code || null,
+    },
+  });
+
+  return {
+    payment_id: payment.id,
+    transaction_id: gatewayResponse.transaction_id,
+    qr_code: gatewayResponse.qr_code,
+    payment_url: gatewayResponse.payment_url,
+    expires_at: payment.expires_at,
+  };
+}
+```
+
+#### **Method 2: `handleMoMoCallback()` - XỬ LÝ MOMO CALLBACK**
+
+```typescript
+async handleMoMoCallback(data: {
+  orderId: string;
   requestId: string;
   amount: number;
   orderInfo: string;
   orderType: string;
-  transId: number; // MoMo transaction ID
-  resultCode: number; // 0 = success
+  transId: string;
+  resultCode: number;
   message: string;
   payType: string;
   responseTime: number;
   extraData: string;
   signature: string;
+}) {
+  // 1. Verify signature
+  const isValid = this.momoService.verifySignature(data);
+  if (!isValid) {
+    throw new BadRequestException('Invalid MoMo signature');
+  }
+
+  // 2. Tìm payment (orderId chính là payment_id)
+  const payment = await this.prisma.payments.findUnique({
+    where: { id: data.orderId },
+    include: { billRequest: true },
+  });
+
+  if (!payment) {
+    throw new NotFoundException('Payment not found');
+  }
+
+  // 3. Update payment status
+  const status = data.resultCode === 0 ? 'completed' : 'failed';
+
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      status,
+      transaction_id: data.transId.toString(),
+      paid_at: status === 'completed' ? new Date() : null,
+      error_message: status === 'failed' ? data.message : null,
+    },
+  });
+
+  // 4. Nếu thành công, complete bill
+  if (status === 'completed') {
+    await this.completeBillPayment(payment.bill_request_id);
+  }
+
+  return { status, payment_id: payment.id };
 }
 ```
 
-#### **File:** `backend/src/payments/dto/zalopay-callback.dto.ts`
+#### **Method 3: `handleZaloPayCallback()` - XỬ LÝ ZALOPAY CALLBACK**
 
 ```typescript
-export class ZaloPayCallbackDto {
-  data: string; // JSON string
-  mac: string; // MAC signature
-}
-
-export interface ZaloPayCallbackData {
-  app_id: number;
-  app_trans_id: string; // Our payment ID
+async handleZaloPayCallback(data: {
+  app_id: string;
+  app_trans_id: string;
   app_time: number;
   app_user: string;
   amount: number;
   embed_data: string;
   item: string;
-  zp_trans_id: number; // ZaloPay transaction ID
+  zp_trans_id: string;
   server_time: number;
   channel: number;
   merchant_user_id: string;
+  user_fee_amount: number;
+  discount_amount: number;
+  status: number;
+  mac: string;
+}) {
+  // 1. Verify MAC
+  const isValid = this.zalopayService.verifyMAC(data);
+  if (!isValid) {
+    throw new BadRequestException('Invalid ZaloPay MAC');
+  }
+
+  // 2. Parse embed_data
+  const embedData = JSON.parse(data.embed_data);
+  const payment = await this.prisma.payments.findUnique({
+    where: { id: embedData.payment_id },
+    include: { billRequest: true },
+  });
+
+  if (!payment) {
+    throw new NotFoundException('Payment not found');
+  }
+
+  // 3. Update payment
+  const status = data.status === 1 ? 'completed' : 'failed';
+
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      status,
+      transaction_id: data.zp_trans_id.toString(),
+      paid_at: status === 'completed' ? new Date() : null,
+    },
+  });
+
+  // 4. Complete bill
+  if (status === 'completed') {
+    await this.completeBillPayment(payment.bill_request_id);
+  }
+
+  return { return_code: 1, return_message: 'success' };
 }
 ```
 
-#### **File:** `backend/src/payments/dto/vnpay-ipn.dto.ts`
+#### **Method 4: `handleVNPayIPN()` - XỬ LÝ VNPAY IPN**
 
 ```typescript
-export class VNPayIPNDto {
-  vnp_Amount: string;
-  vnp_BankCode: string;
-  vnp_BankTranNo: string;
-  vnp_CardType: string;
-  vnp_OrderInfo: string;
-  vnp_PayDate: string;
-  vnp_ResponseCode: string; // '00' = success
-  vnp_TmnCode: string;
-  vnp_TransactionNo: string; // VNPay transaction ID
-  vnp_TransactionStatus: string;
-  vnp_TxnRef: string; // Our payment ID
-  vnp_SecureHash: string; // Signature
+async handleVNPayIPN(query: any) {
+  // 1. Verify signature
+  const isValid = this.vnpayService.verifySignature(query);
+  if (!isValid) {
+    return { RspCode: '97', Message: 'Invalid signature' };
+  }
+
+  // 2. Lấy payment_id từ vnp_TxnRef
+  const payment_id = query.vnp_TxnRef;
+  const payment = await this.prisma.payments.findUnique({
+    where: { id: payment_id },
+    include: { billRequest: true },
+  });
+
+  if (!payment) {
+    return { RspCode: '01', Message: 'Order not found' };
+  }
+
+  // 3. Kiểm tra amount
+  const vnp_Amount = parseInt(query.vnp_Amount) / 100;
+  if (vnp_Amount !== payment.total_amount) {
+    return { RspCode: '04', Message: 'Invalid amount' };
+  }
+
+  // 4. Update payment
+  const responseCode = query.vnp_ResponseCode;
+  const status = responseCode === '00' ? 'completed' : 'failed';
+
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      status,
+      transaction_id: query.vnp_TransactionNo,
+      paid_at: status === 'completed' ? new Date() : null,
+      error_message: status === 'failed' ? query.vnp_Message : null,
+    },
+  });
+
+  // 5. Complete bill
+  if (status === 'completed') {
+    await this.completeBillPayment(payment.bill_request_id);
+  }
+
+  return { RspCode: '00', Message: 'Confirm Success' };
 }
 ```
 
-#### **File:** `backend/src/payments/dto/cash-confirm.dto.ts`
+#### **Method 5: `confirmCashPayment()` - XÁC NHẬN TIỀN MẶT**
 
 ```typescript
-import { IsUUID, IsNumber, IsString, IsOptional, Min } from 'class-validator';
-
-export class CashConfirmDto {
-  @IsUUID()
+async confirmCashPayment(dto: {
   payment_id: string;
+  received_amount: number;
+  waiter_id: string;
+}) {
+  const { payment_id, received_amount, waiter_id } = dto;
 
-  @IsNumber()
-  @Min(0)
-  cash_amount: number; // Tiền khách đưa
+  const payment = await this.prisma.payments.findUnique({
+    where: { id: payment_id },
+    include: { billRequest: true },
+  });
 
-  @IsString()
-  @IsOptional()
-  notes?: string; // Ghi chú (optional)
+  if (!payment) {
+    throw new NotFoundException('Payment not found');
+  }
+
+  if (received_amount < payment.total_amount) {
+    throw new BadRequestException('Received amount is less than total amount');
+  }
+
+  const change = received_amount - payment.total_amount;
+
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      status: 'completed',
+      paid_at: new Date(),
+      transaction_id: `CASH-${Date.now()}`,
+    },
+  });
+
+  await this.completeBillPayment(payment.bill_request_id);
+
+  return {
+    payment_id,
+    change_amount: change,
+    message: 'Cash payment confirmed',
+  };
+}
+```
+
+#### **Private Helper: `completeBillPayment()`**
+
+```typescript
+private async completeBillPayment(bill_request_id: string) {
+  const billRequest = await this.prisma.bill_requests.findUnique({
+    where: { id: bill_request_id },
+    include: { orders: true },
+  });
+
+  if (!billRequest) {
+    throw new NotFoundException('Bill request not found');
+  }
+
+  // Update tất cả orders sang 'paid'
+  await this.prisma.order.updateMany({
+    where: {
+      id: { in: billRequest.orders.map((o) => o.id) },
+    },
+    data: {
+      status: 'paid',
+    },
+  });
+
+  // Update bill_request sang 'paid'
+  await this.prisma.bill_requests.update({
+    where: { id: bill_request_id },
+    data: {
+      status: 'paid',
+    },
+  });
+
+  // TODO Phase 4: Emit socket event 'bill-paid'
+
+  return { success: true };
 }
 ```
 
 ---
 
-### **Step 3: MoMo Service**
+### **📋 BƯỚC 3.2: MoMoService - GATEWAY IMPLEMENTATION**
 
-#### **File:** `backend/src/payments/momo.service.ts`
+**File:** `src/payments/momo/momo.service.ts`
+
+#### **Environment Variables (.env):**
+
+```env
+MOMO_PARTNER_CODE=your_partner_code
+MOMO_ACCESS_KEY=your_access_key
+MOMO_SECRET_KEY=your_secret_key
+MOMO_ENDPOINT=https://test-payment.momo.vn/v2/gateway/api/create
+MOMO_IPN_URL=https://your-domain.com/api/payments/momo/callback
+MOMO_REDIRECT_URL=https://your-frontend.com/payment/result
+```
+
+#### **Service Code:**
 
 ```typescript
-import { Injectable, Logger } from '@nestjs/common';
-import * as crypto from 'crypto-js';
-import axios from 'axios';
+import { Injectable } from "@nestjs/common";
+import * as crypto from "crypto";
+import axios from "axios";
+import { ConfigService } from "@nestjs/config";
 
 @Injectable()
-export class MoMoService {
-  private readonly logger = new Logger(MoMOService.name);
+export class MomoService {
   private readonly partnerCode: string;
   private readonly accessKey: string;
   private readonly secretKey: string;
   private readonly endpoint: string;
+  private readonly ipnUrl: string;
+  private readonly redirectUrl: string;
 
-  constructor() {
-    this.partnerCode = process.env.MOMO_PARTNER_CODE;
-    this.accessKey = process.env.MOMO_ACCESS_KEY;
-    this.secretKey = process.env.MOMO_SECRET_KEY;
-    this.endpoint = process.env.MOMO_API_URL;
+  constructor(private configService: ConfigService) {
+    this.partnerCode = this.configService.get<string>("MOMO_PARTNER_CODE");
+    this.accessKey = this.configService.get<string>("MOMO_ACCESS_KEY");
+    this.secretKey = this.configService.get<string>("MOMO_SECRET_KEY");
+    this.endpoint = this.configService.get<string>("MOMO_ENDPOINT");
+    this.ipnUrl = this.configService.get<string>("MOMO_IPN_URL");
+    this.redirectUrl = this.configService.get<string>("MOMO_REDIRECT_URL");
   }
 
-  /**
-   * Tạo MoMo payment request
-   */
-  async createPayment(data: {
-    orderId: string; // Payment ID
+  private createSignature(rawData: string): string {
+    return crypto
+      .createHmac("sha256", this.secretKey)
+      .update(rawData)
+      .digest("hex");
+  }
+
+  async createPayment(dto: {
+    payment_id: string;
     amount: number;
-    orderInfo: string;
-    returnUrl: string;
-    notifyUrl: string;
+    order_info: string;
+    restaurant_id: string;
   }) {
-    const requestId = `MOMO_${Date.now()}`;
-    const requestType = 'captureWallet';
-    const extraData = '';
+    const { payment_id, amount, order_info } = dto;
+    const requestId = `${payment_id}-${Date.now()}`;
+    const orderId = payment_id;
+    const requestType = "captureWallet";
+    const extraData = "";
 
-    // Build raw signature (EXACT order từ MoMo docs)
-    const rawSignature = `accessKey=${this.accessKey}&amount=${data.amount}&extraData=${extraData}&ipnUrl=${data.notifyUrl}&orderId=${data.orderId}&orderInfo=${data.orderInfo}&partnerCode=${this.partnerCode}&redirectUrl=${data.returnUrl}&requestId=${requestId}&requestType=${requestType}`;
+    const rawSignature = `accessKey=${this.accessKey}&amount=${amount}&extraData=${extraData}&ipnUrl=${this.ipnUrl}&orderId=${orderId}&orderInfo=${order_info}&partnerCode=${this.partnerCode}&redirectUrl=${this.redirectUrl}&requestId=${requestId}&requestType=${requestType}`;
 
-    // Generate signature using HMAC SHA256
-    const signature = crypto
-      .HmacSHA256(rawSignature, this.secretKey)
-      .toString();
+    const signature = this.createSignature(rawSignature);
 
-    this.logger.log(`Creating MoMo payment: ${data.orderId}`);
-
-    // Request body
     const requestBody = {
       partnerCode: this.partnerCode,
       accessKey: this.accessKey,
       requestId,
-      amount: data.amount,
-      orderId: data.orderId,
-      orderInfo: data.orderInfo,
-      redirectUrl: data.returnUrl,
-      ipnUrl: data.notifyUrl,
+      amount,
+      orderId,
+      orderInfo: order_info,
+      redirectUrl: this.redirectUrl,
+      ipnUrl: this.ipnUrl,
       requestType,
       extraData,
-      lang: 'vi',
+      lang: "vi",
       signature,
     };
 
     try {
-      const response = await axios.post(this.endpoint, requestBody, {
-        headers: { 'Content-Type': 'application/json' },
-      });
+      const response = await axios.post(this.endpoint, requestBody);
 
       if (response.data.resultCode !== 0) {
-        throw new Error(
-          `MoMo error: ${response.data.message} (Code: ${response.data.resultCode})`,
-        );
+        throw new Error(`MoMo error: ${response.data.message}`);
       }
 
       return {
-        payUrl: response.data.payUrl,
-        qrCodeUrl: response.data.qrCodeUrl,
-        requestId,
+        transaction_id: response.data.requestId,
+        qr_code: response.data.qrCodeUrl || null,
+        payment_url: response.data.payUrl,
       };
     } catch (error) {
-      this.logger.error(`MoMo API error: ${error.message}`);
-      throw error;
+      throw new Error(`MoMo API error: ${error.message}`);
     }
   }
 
-  /**
-   * Verify MoMo callback signature
-   */
-  verifySignature(data: MoMoCallbackDto): boolean {
-    const rawSignature = `accessKey=${this.accessKey}&amount=${data.amount}&extraData=${data.extraData}&message=${data.message}&orderId=${data.orderId}&orderInfo=${data.orderInfo}&orderType=${data.orderType}&partnerCode=${data.partnerCode}&payType=${data.payType}&requestId=${data.requestId}&responseTime=${data.responseTime}&resultCode=${data.resultCode}&transId=${data.transId}`;
+  verifySignature(data: any): boolean {
+    const {
+      orderId,
+      requestId,
+      amount,
+      orderInfo,
+      orderType,
+      transId,
+      resultCode,
+      message,
+      payType,
+      responseTime,
+      extraData,
+      signature,
+    } = data;
 
-    const expectedSignature = crypto
-      .HmacSHA256(rawSignature, this.secretKey)
-      .toString();
+    const rawSignature = `accessKey=${this.accessKey}&amount=${amount}&extraData=${extraData}&message=${message}&orderId=${orderId}&orderInfo=${orderInfo}&orderType=${orderType}&partnerCode=${this.partnerCode}&payType=${payType}&requestId=${requestId}&responseTime=${responseTime}&resultCode=${resultCode}&transId=${transId}`;
 
-    return expectedSignature === data.signature;
+    const expectedSignature = this.createSignature(rawSignature);
+    return signature === expectedSignature;
   }
 }
 ```
 
 ---
 
-### **Step 4: ZaloPay Service**
+### **📋 BƯỚC 3.3: ZaloPayService Implementation**
 
-#### **File:** `backend/src/payments/zalopay.service.ts`
+**File:** `src/payments/zalopay/zalopay.service.ts`
+
+#### **Environment Variables:**
+
+```env
+ZALOPAY_APP_ID=your_app_id
+ZALOPAY_KEY1=your_key1
+ZALOPAY_KEY2=your_key2
+ZALOPAY_ENDPOINT=https://sb-openapi.zalopay.vn/v2/create
+ZALOPAY_CALLBACK_URL=https://your-domain.com/api/payments/zalopay/callback
+```
+
+#### **Service Code:**
 
 ```typescript
-import { Injectable, Logger } from '@nestjs/common';
-import * as crypto from 'crypto';
-import axios from 'axios';
-import * as moment from 'moment';
+import { Injectable } from "@nestjs/common";
+import * as crypto from "crypto";
+import axios from "axios";
+import { ConfigService } from "@nestjs/config";
 
 @Injectable()
 export class ZaloPayService {
-  private readonly logger = new Logger(ZaloPayService.name);
   private readonly appId: string;
   private readonly key1: string;
   private readonly key2: string;
   private readonly endpoint: string;
+  private readonly callbackUrl: string;
 
-  constructor() {
-    this.appId = process.env.ZALOPAY_APP_ID;
-    this.key1 = process.env.ZALOPAY_KEY1;
-    this.key2 = process.env.ZALOPAY_KEY2;
-    this.endpoint = process.env.ZALOPAY_API_URL;
+  constructor(private configService: ConfigService) {
+    this.appId = this.configService.get<string>("ZALOPAY_APP_ID");
+    this.key1 = this.configService.get<string>("ZALOPAY_KEY1");
+    this.key2 = this.configService.get<string>("ZALOPAY_KEY2");
+    this.endpoint = this.configService.get<string>("ZALOPAY_ENDPOINT");
+    this.callbackUrl = this.configService.get<string>("ZALOPAY_CALLBACK_URL");
   }
 
-  /**
-   * Tạo ZaloPay order
-   */
-  async createOrder(data: {
-    orderId: string; // Payment ID
+  private createMAC(data: string, key: string): string {
+    return crypto.createHmac("sha256", key).update(data).digest("hex");
+  }
+
+  async createOrder(dto: {
+    payment_id: string;
     amount: number;
     description: string;
-    callbackUrl: string;
+    restaurant_id: string;
   }) {
-    const app_trans_id = `${moment().format('YYMMDD')}_${data.orderId}`;
-    const embed_data = JSON.stringify({});
-    const items = JSON.stringify([]);
+    const { payment_id, amount, description } = dto;
+    const app_trans_id = `${Date.now()}_${payment_id}`;
     const app_time = Date.now();
+    const embed_data = JSON.stringify({ payment_id });
 
-    // Build MAC (Message Authentication Code)
-    const macData = `${this.appId}|${app_trans_id}|${data.amount}|${data.description}|${app_time}|${embed_data}|${items}`;
-    const mac = crypto
-      .createHmac('sha256', this.key1)
-      .update(macData)
-      .digest('hex');
-
-    this.logger.log(`Creating ZaloPay order: ${app_trans_id}`);
-
-    const orderData = {
+    const order = {
       app_id: this.appId,
-      app_trans_id,
-      app_user: 'user123', // Customer ID
-      amount: data.amount,
+      app_user: "customer",
       app_time,
+      amount,
+      app_trans_id,
       embed_data,
-      item: items,
-      description: data.description,
-      callback_url: data.callbackUrl,
-      mac,
+      item: JSON.stringify([{ name: description }]),
+      description,
+      callback_url: this.callbackUrl,
     };
 
+    const data = `${order.app_id}|${order.app_trans_id}|${order.app_user}|${order.amount}|${order.app_time}|${order.embed_data}|${order.item}`;
+    const mac = this.createMAC(data, this.key1);
+
+    const requestBody = { ...order, mac };
+
     try {
-      const response = await axios.post(this.endpoint, orderData, {
-        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      const response = await axios.post(this.endpoint, null, {
+        params: requestBody,
       });
 
       if (response.data.return_code !== 1) {
-        throw new Error(
-          `ZaloPay error: ${response.data.return_message} (Code: ${response.data.return_code})`,
-        );
+        throw new Error(`ZaloPay error: ${response.data.return_message}`);
       }
 
       return {
-        orderUrl: response.data.order_url,
-        zpTransToken: response.data.zp_trans_token,
-        appTransId: app_trans_id,
+        transaction_id: app_trans_id,
+        payment_url: response.data.order_url,
+        qr_code: null,
       };
     } catch (error) {
-      this.logger.error(`ZaloPay API error: ${error.message}`);
-      throw error;
+      throw new Error(`ZaloPay API error: ${error.message}`);
     }
   }
 
-  /**
-   * Verify ZaloPay callback MAC
-   */
-  verifyCallback(data: string, receivedMac: string): boolean {
-    const expectedMac = crypto
-      .createHmac('sha256', this.key2)
-      .update(data)
-      .digest('hex');
-
-    return expectedMac === receivedMac;
+  verifyMAC(data: any): boolean {
+    const {
+      app_id,
+      app_trans_id,
+      app_time,
+      app_user,
+      amount,
+      embed_data,
+      item,
+      mac,
+    } = data;
+    const rawData = `${app_id}|${app_trans_id}|${app_user}|${amount}|${app_time}|${embed_data}|${item}`;
+    const expectedMAC = this.createMAC(rawData, this.key2);
+    return mac === expectedMAC;
   }
 }
 ```
 
 ---
 
-### **Step 5: VNPay Service**
+### **📋 BƯỚC 3.4: VNPayService Implementation**
 
-#### **File:** `backend/src/payments/vnpay.service.ts`
+**File:** `src/payments/vnpay/vnpay.service.ts`
+
+#### **Environment Variables:**
+
+```env
+VNPAY_TMN_CODE=your_tmn_code
+VNPAY_HASH_SECRET=your_hash_secret
+VNPAY_URL=https://sandbox.vnpayment.vn/paymentv2/vpcpay.html
+VNPAY_RETURN_URL=https://your-frontend.com/payment/result
+VNPAY_IPN_URL=https://your-domain.com/api/payments/vnpay/ipn
+```
+
+#### **Service Code:**
 
 ```typescript
-import { Injectable, Logger } from '@nestjs/common';
-import * as crypto from 'crypto';
-import * as querystring from 'querystring';
-import * as moment from 'moment';
+import { Injectable } from "@nestjs/common";
+import * as crypto from "crypto";
+import * as querystring from "querystring";
+import { ConfigService } from "@nestjs/config";
 
 @Injectable()
-export class VNPayService {
-  private readonly logger = new Logger(VNPayService.name);
+export class VnPayService {
   private readonly tmnCode: string;
   private readonly hashSecret: string;
   private readonly url: string;
   private readonly returnUrl: string;
+  private readonly ipnUrl: string;
 
-  constructor() {
-    this.tmnCode = process.env.VNPAY_TMN_CODE;
-    this.hashSecret = process.env.VNPAY_HASH_SECRET;
-    this.url = process.env.VNPAY_API_URL;
-    this.returnUrl = process.env.VNPAY_RETURN_URL;
+  constructor(private configService: ConfigService) {
+    this.tmnCode = this.configService.get<string>("VNPAY_TMN_CODE");
+    this.hashSecret = this.configService.get<string>("VNPAY_HASH_SECRET");
+    this.url = this.configService.get<string>("VNPAY_URL");
+    this.returnUrl = this.configService.get<string>("VNPAY_RETURN_URL");
+    this.ipnUrl = this.configService.get<string>("VNPAY_IPN_URL");
   }
 
-  /**
-   * Tạo VNPay payment URL
-   */
-  createPaymentUrl(data: {
-    orderId: string; // Payment ID
-    amount: number;
-    orderInfo: string;
-    ipAddr: string;
-  }): string {
-    const createDate = moment().format('YYYYMMDDHHmmss');
-    const txnRef = data.orderId;
-
-    // VNPay requires amount in VND with no decimal (multiply by 100)
-    const amount = data.amount * 100;
-
-    let vnp_Params: any = {
-      vnp_Version: '2.1.0',
-      vnp_Command: 'pay',
-      vnp_TmnCode: this.tmnCode,
-      vnp_Locale: 'vn',
-      vnp_CurrCode: 'VND',
-      vnp_TxnRef: txnRef,
-      vnp_OrderInfo: data.orderInfo,
-      vnp_OrderType: 'other',
-      vnp_Amount: amount,
-      vnp_ReturnUrl: this.returnUrl,
-      vnp_IpAddr: data.ipAddr,
-      vnp_CreateDate: createDate,
-    };
-
-    // Sort params by key
-    vnp_Params = this.sortObject(vnp_Params);
-
-    // Build query string
-    const signData = querystring.stringify(vnp_Params);
-
-    // Generate SecureHash
-    const secureHash = crypto
-      .createHmac('sha512', this.hashSecret)
-      .update(Buffer.from(signData, 'utf-8'))
-      .digest('hex');
-
-    vnp_Params['vnp_SecureHash'] = secureHash;
-
-    const paymentUrl = this.url + '?' + querystring.stringify(vnp_Params);
-
-    this.logger.log(`Created VNPay payment URL for: ${txnRef}`);
-    return paymentUrl;
+  private createHash(data: string): string {
+    return crypto
+      .createHmac("sha512", this.hashSecret)
+      .update(data)
+      .digest("hex");
   }
 
-  /**
-   * Verify VNPay IPN signature
-   */
-  verifyIPN(vnp_Params: any): boolean {
-    const secureHash = vnp_Params['vnp_SecureHash'];
-    delete vnp_Params['vnp_SecureHash'];
-    delete vnp_Params['vnp_SecureHashType'];
-
-    const sortedParams = this.sortObject(vnp_Params);
-    const signData = querystring.stringify(sortedParams);
-
-    const expectedHash = crypto
-      .createHmac('sha512', this.hashSecret)
-      .update(Buffer.from(signData, 'utf-8'))
-      .digest('hex');
-
-    return secureHash === expectedHash;
-  }
-
-  /**
-   * Sort object by key
-   */
   private sortObject(obj: any): any {
-    const sorted: any = {};
+    const sorted = {};
     const keys = Object.keys(obj).sort();
     keys.forEach((key) => {
       sorted[key] = obj[key];
     });
     return sorted;
   }
+
+  createPaymentUrl(dto: {
+    payment_id: string;
+    amount: number;
+    order_info: string;
+    restaurant_id: string;
+  }) {
+    const { payment_id, amount, order_info } = dto;
+    const date = new Date();
+    const createDate = this.formatDate(date);
+    const expireDate = this.formatDate(
+      new Date(date.getTime() + 15 * 60 * 1000)
+    );
+
+    let vnp_Params: any = {
+      vnp_Version: "2.1.0",
+      vnp_Command: "pay",
+      vnp_TmnCode: this.tmnCode,
+      vnp_Amount: amount * 100,
+      vnp_CreateDate: createDate,
+      vnp_CurrCode: "VND",
+      vnp_IpAddr: "127.0.0.1",
+      vnp_Locale: "vn",
+      vnp_OrderInfo: order_info,
+      vnp_OrderType: "other",
+      vnp_ReturnUrl: this.returnUrl,
+      vnp_TxnRef: payment_id,
+      vnp_ExpireDate: expireDate,
+    };
+
+    vnp_Params = this.sortObject(vnp_Params);
+    const signData = querystring.stringify(vnp_Params, { encode: false });
+    const secureHash = this.createHash(signData);
+    vnp_Params["vnp_SecureHash"] = secureHash;
+
+    const paymentUrl =
+      this.url + "?" + querystring.stringify(vnp_Params, { encode: true });
+
+    return {
+      transaction_id: payment_id,
+      payment_url: paymentUrl,
+      qr_code: null,
+    };
+  }
+
+  verifySignature(query: any): boolean {
+    const vnp_SecureHash = query["vnp_SecureHash"];
+    delete query["vnp_SecureHash"];
+    delete query["vnp_SecureHashType"];
+
+    const sortedParams = this.sortObject(query);
+    const signData = querystring.stringify(sortedParams, { encode: false });
+    const expectedHash = this.createHash(signData);
+
+    return vnp_SecureHash === expectedHash;
+  }
+
+  private formatDate(date: Date): string {
+    const year = date.getFullYear();
+    const month = String(date.getMonth() + 1).padStart(2, "0");
+    const day = String(date.getDate()).padStart(2, "0");
+    const hours = String(date.getHours()).padStart(2, "0");
+    const minutes = String(date.getMinutes()).padStart(2, "0");
+    const seconds = String(date.getSeconds()).padStart(2, "0");
+    return `${year}${month}${day}${hours}${minutes}${seconds}`;
+  }
 }
 ```
 
 ---
 
-### **Step 6: Cash Payment Service**
+### **📋 BƯỚC 3.5: CashService Implementation**
 
-#### **File:** `backend/src/payments/cash.service.ts`
+**File:** `src/payments/cash/cash.service.ts`
 
 ```typescript
-import { Injectable, Logger } from '@nestjs/common';
+import { Injectable } from "@nestjs/common";
 
 @Injectable()
-export class CashPaymentService {
-  private readonly logger = new Logger(CashPaymentService.name);
+export class CashService {
+  async createCashPayment(dto: { payment_id: string; amount: number }) {
+    const { payment_id, amount } = dto;
 
-  /**
-   * Tính tiền thối lại
-   */
-  calculateChange(orderAmount: number, cashReceived: number): number {
-    if (cashReceived < orderAmount) {
-      throw new Error('Số tiền nhận không đủ để thanh toán');
-    }
-    return cashReceived - orderAmount;
+    return {
+      transaction_id: `CASH-${Date.now()}`,
+      payment_url: null,
+      qr_code: null,
+      message: "Please collect cash from customer",
+      amount_to_collect: amount,
+    };
   }
 
-  /**
-   * Validate cash payment
-   */
-  validateCashPayment(data: {
-    orderAmount: number;
-    cashAmount: number;
-  }): { isValid: boolean; changeAmount: number; error?: string } {
-    if (data.cashAmount < data.orderAmount) {
-      return {
-        isValid: false,
-        changeAmount: 0,
-        error: `Số tiền nhận (${data.cashAmount.toLocaleString('vi-VN')}đ) không đủ. Cần ${data.orderAmount.toLocaleString('vi-VN')}đ`,
-      };
+  calculateChange(received: number, total: number): number {
+    if (received < total) {
+      throw new Error("Received amount is less than total");
+    }
+    return received - total;
+  }
+
+  suggestChange(changeAmount: number): { [key: string]: number } {
+    const denominations = [
+      500000, 200000, 100000, 50000, 20000, 10000, 5000, 2000, 1000,
+    ];
+    const result: { [key: string]: number } = {};
+    let remaining = changeAmount;
+
+    for (const denom of denominations) {
+      if (remaining >= denom) {
+        const count = Math.floor(remaining / denom);
+        result[`${denom}đ`] = count;
+        remaining -= count * denom;
+      }
     }
 
-    const change = this.calculateChange(data.orderAmount, data.cashAmount);
-    this.logger.log(
-      `Cash payment validated: Amount=${data.orderAmount}, Received=${data.cashAmount}, Change=${change}`,
+    return result;
+  }
+}
+```
+
+---
+
+### **✅ CHECKLIST PHASE 3:**
+
+#### **PaymentsService (5 methods):**
+
+- [ ] `initiatePaymentFromBillRequest()` - Tạo payment từ bill request
+- [ ] `handleMoMoCallback()` - Xử lý MoMo callback
+- [ ] `handleZaloPayCallback()` - Xử lý ZaloPay callback
+- [ ] `handleVNPayIPN()` - Xử lý VNPay IPN
+- [ ] `confirmCashPayment()` - Xác nhận tiền mặt
+- [ ] `completeBillPayment()` - Private helper
+
+#### **Gateway Services:**
+
+- [ ] **MomoService**: `createPayment()`, `verifySignature()`
+- [ ] **ZaloPayService**: `createOrder()`, `verifyMAC()`
+- [ ] **VNPayService**: `createPaymentUrl()`, `verifySignature()`, `formatDate()`
+- [ ] **CashService**: `createCashPayment()`, `calculateChange()`, `suggestChange()`
+
+#### **Configuration:**
+
+- [ ] Thêm 5 environment variables cho MoMo
+- [ ] Thêm 5 environment variables cho ZaloPay
+- [ ] Thêm 5 environment variables cho VNPay
+
+#### **Integration:**
+
+- [ ] Update `bill-requests.service.ts` để gọi `initiatePaymentFromBillRequest()`
+- [ ] Inject `PaymentsService` vào `BillRequestsService`
+- [ ] Update `bill-requests.module.ts` imports
+
+---
+
+## ✅ PHASE 3: PAYMENT INTEGRATION (4h)
+
+**[TIẾP TỤC...]**
+
+### **Bước 3.1: Thêm method mới trong PaymentsService**
+
+**File:** `src/payments/payments.service.ts`
+
+Thêm method này vào class `PaymentsService`:
+
+```typescript
+/**
+ * Tạo payment từ bill request (được gọi khi waiter accept)
+ * Tác dụng: Khởi tạo payment và generate QR code cho online payment
+ */
+async initiatePaymentFromBillRequest(dto: {
+  bill_request_id: string;
+  payment_method: string;
+  amount: number;
+  tips_amount: number;
+  order_ids: string[];
+}) {
+  // 1. Lấy payment method từ DB
+  const paymentMethod = await this.prisma.payment_methods.findFirst({
+    where: { code: dto.payment_method }
+  });
+
+  if (!paymentMethod) {
+    throw new NotFoundException(`Payment method ${dto.payment_method} không tồn tại`);
+  }
+
+  // 2. Tạo payment record
+  const payment = await this.prisma.payments.create({
+    data: {
+      order_id: null, // Null vì batch payment
+      payment_method_id: paymentMethod.id,
+      bill_request_id: dto.bill_request_id,
+      merged_order_ids: dto.order_ids, // JSON array
+      amount: dto.amount,
+      tips_amount: dto.tips_amount,
+      status: 'pending',
+    }
+  });
+
+  // 3. Generate QR/Payment URL theo method
+  if (dto.payment_method === 'cash') {
+    return {
+      payment_id: payment.id,
+      awaiting_cash_confirmation: true,
+    };
+  }
+
+  // 4. Gọi gateway service để generate QR
+  let paymentResult;
+
+  switch (dto.payment_method) {
+    case 'momo':
+      paymentResult = await this.momoService.createPayment({
+        order_id: payment.id,
+        amount: dto.amount,
+        order_info: `Bill Request - ${dto.order_ids.length} orders`,
+      });
+      break;
+
+    case 'zalopay':
+      paymentResult = await this.zalopayService.createPayment({
+        // Similar
+      });
+      break;
+
+    case 'vnpay':
+      paymentResult = await this.vnpayService.createPayment({
+        // Similar
+      });
+      break;
+  }
+
+  // 5. Update payment với gateway info
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      gateway_request_id: paymentResult.request_id,
+    }
+  });
+
+  return {
+    payment_id: payment.id,
+    qr_code_url: paymentResult.qr_code_url,
+    qr_code_data: paymentResult.qr_code_data,
+    pay_url: paymentResult.pay_url,
+    expires_at: paymentResult.expires_at,
+  };
+}
+```
+
+---
+
+### **Bước 3.2: Update BillRequestsService để gọi PaymentsService**
+
+**File:** `src/bill-requests/bill-requests.service.ts`
+
+Inject `PaymentsService` và update method `acceptBillRequest`:
+
+```typescript
+import { PaymentsService } from "../payments/payments.service";
+
+@Injectable()
+export class BillRequestsService {
+  constructor(
+    private prisma: PrismaService,
+    private paymentsService: PaymentsService // 🆕 INJECT
+  ) {}
+
+  async acceptBillRequest(billRequestId: string, waiterId: string) {
+    // ... existing validation code ...
+
+    // Update bill request status
+    await this.prisma.billRequest.update({
+      where: { id: billRequestId },
+      data: {
+        status: "accepted",
+        accepted_by: waiterId,
+        accepted_at: new Date(),
+      },
+    });
+
+    // 🆕 THÊM: Tạo payment và generate QR
+    const paymentResult =
+      await this.paymentsService.initiatePaymentFromBillRequest({
+        bill_request_id: billRequestId,
+        payment_method: billRequest.payment_method_code,
+        amount: Number(billRequest.total_amount),
+        tips_amount: Number(billRequest.tips_amount),
+        order_ids: billRequest.order_ids as string[],
+      });
+
+    return {
+      bill_request_id: billRequestId,
+      payment_id: paymentResult.payment_id,
+      payment_method: billRequest.payment_method_code,
+      total_amount: Number(billRequest.total_amount),
+      ...paymentResult, // QR code, pay_url, etc.
+    };
+  }
+}
+```
+
+---
+
+### **Bước 3.3: Update BillRequestsModule**
+
+**File:** `src/bill-requests/bill-requests.module.ts`
+
+```typescript
+import { PaymentsModule } from "../payments/payments.module";
+
+@Module({
+  imports: [
+    PrismaModule,
+    PaymentsModule, // 🆕 THÊM
+  ],
+  controllers: [BillRequestsController],
+  providers: [BillRequestsService],
+  exports: [BillRequestsService],
+})
+export class BillRequestsModule {}
+```
+
+---
+
+### **Bước 3.4: Update Payment Callbacks để handle Bill Request**
+
+**File:** `src/payments/payments.service.ts`
+
+Update các callback handlers (MoMo, ZaloPay, VNPay):
+
+```typescript
+async handleMoMoCallback(callbackData: any) {
+  const payment = await this.prisma.payments.findFirst({
+    where: { gateway_request_id: callbackData.requestId }
+  });
+
+  if (!payment) {
+    throw new NotFoundException('Payment không tồn tại');
+  }
+
+  // Update payment status
+  await this.prisma.payments.update({
+    where: { id: payment.id },
+    data: {
+      status: callbackData.resultCode === 0 ? 'completed' : 'failed',
+      gateway_trans_id: callbackData.transId,
+      gateway_response: callbackData,
+      completed_at: new Date(),
+    }
+  });
+
+  if (callbackData.resultCode === 0) {
+    // 🆕 THÊM: Handle batch payment
+    if (payment.merged_order_ids) {
+      // Update tất cả orders thành completed
+      const orderIds = payment.merged_order_ids as string[];
+      await this.prisma.order.updateMany({
+        where: { id: { in: orderIds } },
+        data: { status: 'completed', completed_at: new Date() }
+      });
+
+      // Update bill request status
+      if (payment.bill_request_id) {
+        await this.prisma.billRequest.update({
+          where: { id: payment.bill_request_id },
+          data: { status: 'completed' }
+        });
+      }
+    } else {
+      // Single order
+      await this.prisma.order.update({
+        where: { id: payment.order_id },
+        data: { status: 'completed', completed_at: new Date() }
+      });
+    }
+
+    // TODO: Socket.IO notification (Phase 4)
+  }
+
+  return { success: true };
+}
+```
+
+---
+
+### **✅ CHECKLIST PHASE 3**
+
+```
+□ Update: payments.service.ts - Add initiatePaymentFromBillRequest()
+□ Update: bill-requests.service.ts - Inject PaymentsService
+□ Update: bill-requests.service.ts - Call payment trong acceptBillRequest()
+□ Update: bill-requests.module.ts - Import PaymentsModule
+□ Update: payments.service.ts - Handle merged_order_ids trong callbacks
+□ Update: payments.service.ts - Update bill_request status sau payment
+□ Test: Tạo bill request → Accept → Check payment created
+□ Test: Mock callback → Check orders updated to completed
+□ Commit: git add . && git commit -m "feat(payments): integrate with bill requests"
+```
+
+---
+
+## ✅ PHASE 4: SOCKET.IO EVENTS (2h)
+
+### **Bước 4.1: Update NotificationsGateway**
+
+**File:** `src/notifications/notifications.gateway.ts`
+
+Thêm methods mới:
+
+```typescript
+/**
+ * Notify tất cả waiters của restaurant khi có bill request mới
+ */
+notifyWaiters(restaurantId: string, event: string, data: any) {
+  // Lấy tất cả socket connections của waiters thuộc restaurant này
+  const waiterSockets = this.getWaiterSocketsByRestaurant(restaurantId);
+
+  waiterSockets.forEach(socket => {
+    socket.emit(event, data);
+  });
+}
+
+/**
+ * Notify customer tại bàn cụ thể
+ */
+notifyTable(tableId: string, event: string, data: any) {
+  // Lấy socket connection của customer tại bàn này
+  const customerSocket = this.getCustomerSocketByTable(tableId);
+
+  if (customerSocket) {
+    customerSocket.emit(event, data);
+  }
+}
+
+// Helper method để track sockets
+private getWaiterSocketsByRestaurant(restaurantId: string) {
+  // TODO: Implement socket tracking
+  // Có thể dùng Map<restaurantId, Set<socketId>>
+  return [];
+}
+
+private getCustomerSocketByTable(tableId: string) {
+  // TODO: Implement
+  return null;
+}
+```
+
+---
+
+### **Bước 4.2: Update BillRequestsService để emit events**
+
+**File:** `src/bill-requests/bill-requests.service.ts`
+
+```typescript
+import { NotificationsGateway } from "../notifications/notifications.gateway";
+
+@Injectable()
+export class BillRequestsService {
+  constructor(
+    private prisma: PrismaService,
+    private paymentsService: PaymentsService,
+    private notificationsGateway: NotificationsGateway // 🆕 INJECT
+  ) {}
+
+  async createBillRequest(dto: CreateBillRequestDto, customerId?: string) {
+    // ... existing code ...
+
+    // 🆕 THÊM: Notify waiters
+    this.notificationsGateway.notifyWaiters(
+      table.restaurant_id,
+      "bill_request:new",
+      {
+        id: billRequest.id,
+        table_number: table.table_number,
+        table_location: table.location,
+        total_amount: totalAmount,
+        tips_amount: tipsAmount,
+        payment_method: dto.payment_method,
+        order_count: unpaidOrders.length,
+        customer_note: dto.customer_note,
+        created_at: billRequest.created_at,
+      }
     );
 
     return {
-      isValid: true,
-      changeAmount: change,
+      // ... existing return
     };
   }
-}
-```
 
----
+  async acceptBillRequest(billRequestId: string, waiterId: string) {
+    // ... existing code ...
 
-### **Step 7: Main Payments Service**
-
-#### **File:** `backend/src/payments/payments.service.ts`
-
-```typescript
-import {
-  Injectable,
-  Logger,
-  NotFoundException,
-  BadRequestException,
-} from '@nestjs/common';
-import { PrismaService } from '../prisma/prisma.service';
-import { MoMoService } from './momo.service';
-import { ZaloPayService } from './zalopay.service';
-import { VNPayService } from './vnpay.service';
-import { CashPaymentService } from './cash.service';
-import { NotificationsService } from '../notifications/notifications.service';
-import { CreatePaymentDto } from './dto/create-payment.dto';
-import { CashConfirmDto } from './dto/cash-confirm.dto';
-
-@Injectable()
-export class PaymentsService {
-  private readonly logger = new Logger(PaymentsService.name);
-
-  constructor(
-    private prisma: PrismaService,
-    private momoService: MoMoService,
-    private zalopayService: ZaloPayService,
-    private vnpayService: VNPayService,
-    private cashService: CashPaymentService,
-    private notificationsService: NotificationsService,
-  ) {}
-
-  /**
-   * Tạo payment request
-   */
-  async createPayment(dto: CreatePaymentDto, userId: string) {
-    // 1. Validate order
-    const order = await this.prisma.order.findUnique({
-      where: { id: dto.order_id },
-      include: { items: true },
+    // 🆕 THÊM: Notify customer
+    const waiter = await this.prisma.user.findUnique({
+      where: { id: waiterId },
+      select: { full_name: true },
     });
 
-    if (!order) {
-      throw new NotFoundException('Order không tồn tại');
-    }
-
-    if (order.status !== 'served') {
-      throw new BadRequestException(
-        'Chỉ có thể thanh toán order đã served',
-      );
-    }
-
-    // 2. Get payment method
-    const paymentMethod = await this.prisma.paymentMethod.findUnique({
-      where: { code: dto.method },
-    });
-
-    if (!paymentMethod || !paymentMethod.is_active) {
-      throw new BadRequestException('Phương thức thanh toán không khả dụng');
-    }
-
-    // 3. Create payment record
-    const payment = await this.prisma.payment.create({
-      data: {
-        order_id: dto.order_id,
-        payment_method_id: paymentMethod.id,
-        amount: order.total_amount,
-        status: 'pending',
-      },
-    });
-
-    // 4. Generate payment URL/info based on method
-    let paymentInfo: any;
-
-    try {
-      switch (dto.method) {
-        case 'momo':
-          paymentInfo = await this.momoService.createPayment({
-            orderId: payment.id,
-            amount: Number(order.total_amount),
-            orderInfo: `Thanh toán Order #${order.id}`,
-            returnUrl: dto.return_url || process.env.MOMO_REDIRECT_URL,
-            notifyUrl: `${process.env.BACKEND_URL}/api/payments/momo/callback`,
-          });
-          break;
-
-        case 'zalopay':
-          paymentInfo = await this.zalopayService.createOrder({
-            orderId: payment.id,
-            amount: Number(order.total_amount),
-            description: `Thanh toán Order #${order.id}`,
-            callbackUrl: `${process.env.BACKEND_URL}/api/payments/zalopay/callback`,
-          });
-          break;
-
-        case 'vnpay':
-          paymentInfo = {
-            paymentUrl: this.vnpayService.createPaymentUrl({
-              orderId: payment.id,
-              amount: Number(order.total_amount),
-              orderInfo: `Thanh toán Order #${order.id}`,
-              ipAddr: '127.0.0.1', // Get from request
-            }),
-          };
-          break;
-
-        case 'cash':
-          // Không cần generate URL, chỉ tạo payment record
-          paymentInfo = {
-            message: 'Chờ waiter xác nhận thanh toán tiền mặt',
-            paymentId: payment.id,
-          };
-
-          // Notify waiter
-          await this.notificationsService.sendNotification({
-            restaurant_id: order.restaurant_id,
-            user_id: null, // Broadcast to all waiters
-            type: 'CASH_PAYMENT_PENDING',
-            message: `Order #${order.id} chờ xác nhận thanh toán tiền mặt`,
-            metadata: {
-              order_id: order.id,
-              payment_id: payment.id,
-              amount: order.total_amount,
-            },
-          });
-          break;
-
-        default:
-          throw new BadRequestException('Phương thức thanh toán không hợp lệ');
+    this.notificationsGateway.notifyTable(
+      billRequest.table_id,
+      "bill_request:accepted",
+      {
+        bill_request_id: billRequestId,
+        waiter_name: waiter.full_name,
+        message: "Waiter đang xử lý thanh toán của bạn",
       }
-
-      // 5. Update payment with request ID (for online methods)
-      if (dto.method !== 'cash') {
-        await this.prisma.payment.update({
-          where: { id: payment.id },
-          data: {
-            gateway_request_id:
-              paymentInfo.requestId ||
-              paymentInfo.appTransId ||
-              payment.id,
-          },
-        });
-      }
-
-      this.logger.log(`Payment created: ${payment.id} (method: ${dto.method})`);
-
-      return {
-        payment_id: payment.id,
-        method: dto.method,
-        amount: order.total_amount,
-        ...paymentInfo,
-      };
-    } catch (error) {
-      // Rollback: mark payment as failed
-      await this.prisma.payment.update({
-        where: { id: payment.id },
-        data: {
-          status: 'failed',
-          failed_reason: error.message,
-        },
-      });
-
-      throw error;
-    }
-  }
-
-  /**
-   * Xác nhận thanh toán tiền mặt (Waiter only)
-   */
-  async confirmCashPayment(dto: CashConfirmDto, waiterId: string) {
-    // 1. Get payment
-    const payment = await this.prisma.payment.findUnique({
-      where: { id: dto.payment_id },
-      include: {
-        order: true,
-        payment_method: true,
-      },
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment không tồn tại');
-    }
-
-    if (payment.payment_method.code !== 'cash') {
-      throw new BadRequestException(
-        'Chỉ có thể confirm cash payment',
-      );
-    }
-
-    if (payment.status !== 'pending') {
-      throw new BadRequestException(
-        `Payment đã ${payment.status}`,
-      );
-    }
-
-    // 2. Validate cash amount
-    const validation = this.cashService.validateCashPayment({
-      orderAmount: Number(payment.amount),
-      cashAmount: dto.cash_amount,
-    });
-
-    if (!validation.isValid) {
-      throw new BadRequestException(validation.error);
-    }
-
-    // 3. Update payment
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: 'completed',
-        received_by: waiterId,
-        cash_amount: dto.cash_amount,
-        change_amount: validation.changeAmount,
-        notes: dto.notes,
-        completed_at: new Date(),
-      },
-    });
-
-    // 4. Update order status
-    await this.prisma.order.update({
-      where: { id: payment.order_id },
-      data: {
-        status: 'completed',
-        completed_at: new Date(),
-      },
-    });
-
-    // 5. Send notifications
-    await this.notificationsService.sendNotification({
-      restaurant_id: payment.order.restaurant_id,
-      user_id: payment.order.customer_id,
-      type: 'PAYMENT_SUCCESS',
-      message: `Thanh toán Order #${payment.order.id} thành công`,
-      metadata: {
-        order_id: payment.order.id,
-        payment_id: payment.id,
-        amount: payment.amount,
-        method: 'cash',
-      },
-    });
-
-    this.logger.log(`Cash payment confirmed: ${payment.id} by waiter ${waiterId}`);
+    );
 
     return {
-      payment_id: payment.id,
-      order_id: payment.order_id,
-      amount: payment.amount,
-      cash_received: dto.cash_amount,
-      change: validation.changeAmount,
-      status: 'completed',
+      // ... existing return
     };
-  }
-
-  /**
-   * Handle MoMo callback
-   */
-  async handleMoMoCallback(callbackData: any) {
-    // 1. Verify signature
-    const isValid = this.momoService.verifySignature(callbackData);
-    if (!isValid) {
-      throw new BadRequestException('Invalid signature');
-    }
-
-    // 2. Get payment
-    const payment = await this.prisma.payment.findFirst({
-      where: { id: callbackData.orderId },
-      include: { order: true },
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment not found');
-    }
-
-    // 3. Update payment
-    const isSuccess = callbackData.resultCode === 0;
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: isSuccess ? 'completed' : 'failed',
-        gateway_trans_id: callbackData.transId.toString(),
-        gateway_response: callbackData,
-        completed_at: isSuccess ? new Date() : null,
-        failed_reason: isSuccess ? null : callbackData.message,
-      },
-    });
-
-    // 4. Update order if success
-    if (isSuccess) {
-      await this.prisma.order.update({
-        where: { id: payment.order_id },
-        data: {
-          status: 'completed',
-          completed_at: new Date(),
-        },
-      });
-
-      // Send notification
-      await this.notificationsService.sendNotification({
-        restaurant_id: payment.order.restaurant_id,
-        user_id: payment.order.customer_id,
-        type: 'PAYMENT_SUCCESS',
-        message: `Thanh toán MoMo thành công cho Order #${payment.order.id}`,
-        metadata: {
-          order_id: payment.order.id,
-          payment_id: payment.id,
-        },
-      });
-    }
-
-    this.logger.log(`MoMo callback processed: ${payment.id} - ${isSuccess ? 'SUCCESS' : 'FAILED'}`);
-  }
-
-  /**
-   * Handle ZaloPay callback
-   */
-  async handleZaloPayCallback(data: string, mac: string) {
-    // 1. Verify MAC
-    const isValid = this.zalopayService.verifyCallback(data, mac);
-    if (!isValid) {
-      throw new BadRequestException('Invalid MAC');
-    }
-
-    // 2. Parse data
-    const callbackData = JSON.parse(data);
-    const paymentId = callbackData.app_trans_id.split('_')[1]; // Extract payment ID
-
-    // 3. Get payment
-    const payment = await this.prisma.payment.findFirst({
-      where: { id: paymentId },
-      include: { order: true },
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment not found');
-    }
-
-    // 4. Update payment (ZaloPay callback chỉ gửi khi success)
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: 'completed',
-        gateway_trans_id: callbackData.zp_trans_id.toString(),
-        gateway_response: callbackData,
-        completed_at: new Date(),
-      },
-    });
-
-    // 5. Update order
-    await this.prisma.order.update({
-      where: { id: payment.order_id },
-      data: {
-        status: 'completed',
-        completed_at: new Date(),
-      },
-    });
-
-    // 6. Send notification
-    await this.notificationsService.sendNotification({
-      restaurant_id: payment.order.restaurant_id,
-      user_id: payment.order.customer_id,
-      type: 'PAYMENT_SUCCESS',
-      message: `Thanh toán ZaloPay thành công cho Order #${payment.order.id}`,
-      metadata: {
-        order_id: payment.order.id,
-        payment_id: payment.id,
-      },
-    });
-
-    this.logger.log(`ZaloPay callback processed: ${payment.id} - SUCCESS`);
-  }
-
-  /**
-   * Handle VNPay IPN
-   */
-  async handleVNPayIPN(vnp_Params: any) {
-    // 1. Verify signature
-    const isValid = this.vnpayService.verifyIPN(vnp_Params);
-    if (!isValid) {
-      return { RspCode: '97', Message: 'Invalid signature' };
-    }
-
-    // 2. Get payment
-    const payment = await this.prisma.payment.findFirst({
-      where: { id: vnp_Params.vnp_TxnRef },
-      include: { order: true },
-    });
-
-    if (!payment) {
-      return { RspCode: '01', Message: 'Order not found' };
-    }
-
-    // 3. Check amount
-    const expectedAmount = Number(payment.amount) * 100; // VNPay amount in VND
-    if (Number(vnp_Params.vnp_Amount) !== expectedAmount) {
-      return { RspCode: '04', Message: 'Invalid amount' };
-    }
-
-    // 4. Update payment
-    const isSuccess = vnp_Params.vnp_ResponseCode === '00';
-    await this.prisma.payment.update({
-      where: { id: payment.id },
-      data: {
-        status: isSuccess ? 'completed' : 'failed',
-        gateway_trans_id: vnp_Params.vnp_TransactionNo,
-        gateway_response: vnp_Params,
-        completed_at: isSuccess ? new Date() : null,
-        failed_reason: isSuccess ? null : 'VNPay transaction failed',
-      },
-    });
-
-    // 5. Update order if success
-    if (isSuccess) {
-      await this.prisma.order.update({
-        where: { id: payment.order_id },
-        data: {
-          status: 'completed',
-          completed_at: new Date(),
-        },
-      });
-
-      // Send notification
-      await this.notificationsService.sendNotification({
-        restaurant_id: payment.order.restaurant_id,
-        user_id: payment.order.customer_id,
-        type: 'PAYMENT_SUCCESS',
-        message: `Thanh toán VNPay thành công cho Order #${payment.order.id}`,
-        metadata: {
-          order_id: payment.order.id,
-          payment_id: payment.id,
-        },
-      });
-    }
-
-    this.logger.log(`VNPay IPN processed: ${payment.id} - ${isSuccess ? 'SUCCESS' : 'FAILED'}`);
-
-    return { RspCode: '00', Message: 'Success' };
-  }
-
-  /**
-   * Get payment status
-   */
-  async getPaymentStatus(orderId: string) {
-    const payment = await this.prisma.payment.findFirst({
-      where: { order_id: orderId },
-      include: {
-        payment_method: true,
-        order: true,
-      },
-      orderBy: { created_at: 'desc' },
-    });
-
-    if (!payment) {
-      throw new NotFoundException('Payment không tồn tại');
-    }
-
-    return {
-      payment_id: payment.id,
-      order_id: payment.order_id,
-      method: payment.payment_method.name,
-      amount: payment.amount,
-      status: payment.status,
-      completed_at: payment.completed_at,
-      failed_reason: payment.failed_reason,
-    };
-  }
-
-  /**
-   * Get active payment methods
-   */
-  async getPaymentMethods() {
-    return this.prisma.paymentMethod.findMany({
-      where: { is_active: true },
-      orderBy: { display_order: 'asc' },
-      select: {
-        id: true,
-        code: true,
-        name: true,
-        description: true,
-        logo_url: true,
-      },
-    });
   }
 }
 ```
 
 ---
 
-### **Step 8: Payments Controller**
+### **Bước 4.3: Update PaymentsService để emit payment completed**
 
-#### **File:** `backend/src/payments/payments.controller.ts`
+**File:** `src/payments/payments.service.ts`
 
 ```typescript
-import {
-  Controller,
-  Post,
-  Get,
-  Body,
-  Param,
-  UseGuards,
-  Req,
-  HttpCode,
-  HttpStatus,
-} from '@nestjs/common';
-import { PaymentsService } from './payments.service';
-import { JwtAuthGuard } from '../auth/guards/jwt-auth.guard';
-import { RolesGuard } from '../auth/guards/roles.guard';
-import { Roles } from '../auth/decorators/roles.decorator';
-import { CreatePaymentDto } from './dto/create-payment.dto';
-import { CashConfirmDto } from './dto/cash-confirm.dto';
+async handleMoMoCallback(callbackData: any) {
+  // ... existing code ...
 
-@Controller('payments')
-export class PaymentsController {
-  constructor(private readonly paymentsService: PaymentsService) {}
+  if (callbackData.resultCode === 0) {
+    // ... update orders & bill request ...
 
-  /**
-   * Tạo payment (Customer)
-   */
-  @Post('create')
-  @UseGuards(JwtAuthGuard)
-  async createPayment(@Body() dto: CreatePaymentDto, @Req() req: any) {
-    return this.paymentsService.createPayment(dto, req.user.id);
+    // 🆕 THÊM: Notify payment completed
+    if (payment.bill_request_id) {
+      const billRequest = await this.prisma.billRequest.findUnique({
+        where: { id: payment.bill_request_id },
+        include: { table: true }
+      });
+
+      // Notify customer
+      this.notificationsGateway.notifyTable(
+        billRequest.table_id,
+        'payment:completed',
+        {
+          bill_request_id: payment.bill_request_id,
+          payment_id: payment.id,
+          total_amount: Number(payment.amount),
+          payment_method: callbackData.paymentType,
+          message: 'Thanh toán thành công! Cảm ơn quý khách.',
+        }
+      );
+
+      // Notify admin/waiters
+      this.notificationsGateway.notifyWaiters(
+        billRequest.restaurant_id,
+        'payment:received',
+        {
+          table_number: billRequest.table.table_number,
+          amount: Number(payment.amount),
+          tips: Number(payment.tips_amount),
+          method: 'MoMo',
+          bill_request_id: payment.bill_request_id,
+        }
+      );
+    }
   }
 
-  /**
-   * Xác nhận cash payment (Waiter only)
-   */
-  @Post('cash/confirm')
-  @UseGuards(JwtAuthGuard, RolesGuard)
-  @Roles('waiter', 'admin')
-  async confirmCashPayment(@Body() dto: CashConfirmDto, @Req() req: any) {
-    return this.paymentsService.confirmCashPayment(dto, req.user.id);
-  }
-
-  /**
-   * MoMo callback (No auth - called by MoMo)
-   */
-  @Post('momo/callback')
-  @HttpCode(HttpStatus.NO_CONTENT)
-  async momoCallback(@Body() callbackData: any) {
-    await this.paymentsService.handleMoMoCallback(callbackData);
-  }
-
-  /**
-   * ZaloPay callback (No auth - called by ZaloPay)
-   */
-  @Post('zalopay/callback')
-  @HttpCode(HttpStatus.OK)
-  async zalopayCallback(@Body() body: { data: string; mac: string }) {
-    await this.paymentsService.handleZaloPayCallback(body.data, body.mac);
-    return { return_code: 1, return_message: 'success' };
-  }
-
-  /**
-   * VNPay IPN (No auth - called by VNPay)
-   */
-  @Get('vnpay/ipn')
-  async vnpayIPN(@Req() req: any) {
-    return this.paymentsService.handleVNPayIPN(req.query);
-  }
-
-  /**
-   * Get payment status
-   */
-  @Get(':orderId/status')
-  @UseGuards(JwtAuthGuard)
-  async getPaymentStatus(@Param('orderId') orderId: string) {
-    return this.paymentsService.getPaymentStatus(orderId);
-  }
-
-  /**
-   * Get payment methods
-   */
-  @Get('methods')
-  async getPaymentMethods() {
-    return this.paymentsService.getPaymentMethods();
-  }
+  return { success: true };
 }
 ```
 
 ---
 
-### **Step 9: Module Configuration**
+### **✅ CHECKLIST PHASE 4**
 
-#### **File:** `backend/src/payments/payments.module.ts`
+```
+□ Update: notifications.gateway.ts - Add notifyWaiters()
+□ Update: notifications.gateway.ts - Add notifyTable()
+□ Update: bill-requests.service.ts - Inject NotificationsGateway
+□ Update: bill-requests.service.ts - Emit 'bill_request:new' sau tạo
+□ Update: bill-requests.service.ts - Emit 'bill_request:accepted' sau accept
+□ Update: payments.service.ts - Emit 'payment:completed' trong callback
+□ Test: Socket.IO test tool → Listen events
+□ Test: Tạo bill request → Waiter nhận notification
+□ Commit: git add . && git commit -m "feat(socket): add bill request events"
+```
+
+---
+
+## ✅ PHASE 5 & 6: GATEWAY SERVICES & TESTING (6h)
+
+**[Chi tiết tương tự, viết đầy đủ nếu cần]**
+
+---
+
+## 📊 PERFORMANCE NOTES
+
+### **Query tối ưu - QUAN TRỌNG!**
 
 ```typescript
-import { Module } from '@nestjs/common';
-import { PaymentsController } from './payments.controller';
-import { PaymentsService } from './payments.service';
-import { MoMoService } from './momo.service';
-import { ZaloPayService } from './zalopay.service';
-import { VNPayService } from './vnpay.service';
-import { CashPaymentService } from './cash.service';
-import { PrismaModule } from '../prisma/prisma.module';
-import { NotificationsModule } from '../notifications/notifications.module';
+// ❌ SAI - Chậm với dữ liệu lớn
+const allOrders = await prisma.order.findMany({
+  where: { table_id: tableId },
+});
+const unpaidOrders = allOrders.filter((o) => o.status !== "completed");
 
-@Module({
-  imports: [PrismaModule, NotificationsModule],
-  controllers: [PaymentsController],
-  providers: [
-    PaymentsService,
-    MoMoService,
-    ZaloPayService,
-    VNPayService,
-    CashPaymentService,
-  ],
-  exports: [PaymentsService],
-})
-export class PaymentsModule {}
+// ✅ ĐÚNG - Lọc tại database
+const unpaidOrders = await prisma.order.findMany({
+  where: {
+    table_id: tableId,
+    status: { in: ["pending", "accepted", "preparing", "ready", "served"] },
+  },
+});
+```
+
+### **Indexes cần thiết:**
+
+```sql
+-- Đã có sẵn trong schema
 ```
 
 ---
 
-## 🧪 TESTING
+## ✅ MASTER CHECKLIST - TASK 3.1
 
-### **Test 1: MoMo Payment**
+### **Phase 1: Database (1h)**
+- [ ] Update `schema.prisma` với BillRequest model
+- [ ] Chạy `npx prisma migrate dev --name add_bill_requests`
+- [ ] Chạy `npx prisma generate`
+- [ ] Verify trong Prisma Studio
+- [ ] **Commit:** `git commit -m "feat(database): add bill_requests migration"`
 
+### **Phase 2: Bill Requests Module (3h)**
+- [x] Tạo `bill-requests.module.ts`
+- [x] Tạo `bill-requests.controller.ts` với 6 endpoints
+- [x] Tạo `bill-requests.service.ts` với 5 methods
+- [x] Tạo DTOs: `create-bill-request.dto.ts`, `bill-request-response.dto.ts`
+- [ ] **Commit:** `git commit -m "feat(bill-request): implement service and controller"`
+
+### **Phase 3: Gateway Services (6h)**
+- [ ] Thêm env variables cho MoMo (6 vars)
+- [ ] Thêm env variables cho ZaloPay (5 vars)
+- [ ] Thêm env variables cho VNPay (5 vars)
+- [ ] Implement `MomoService`: `createPayment()`, `verifySignature()`
+- [ ] Implement `ZalopayService`: `createOrder()`, `verifyMAC()`
+- [ ] Implement `VnpayService`: `createPaymentUrl()`, `verifySignature()`
+- [ ] Implement `CashService`: `createCashPayment()`, `calculateChange()`
+- [ ] **Commit:** `git commit -m "feat(payment): implement 4 gateway services"`
+
+### **Phase 3: PaymentsService (3h)**
+- [ ] Implement `initiatePaymentFromBillRequest()`
+- [ ] Implement `handleMoMoCallback()`
+- [ ] Implement `handleZaloPayCallback()`
+- [ ] Implement `handleVNPayIPN()`
+- [ ] Implement `confirmCashPayment()`
+- [ ] Implement `completeBillPayment()` helper
+- [ ] Update `bill-requests.service.ts` để inject và gọi PaymentsService
+- [ ] **Commit:** `git commit -m "feat(payment): implement PaymentsService core"`
+
+### **Phase 4: Socket.IO Events (2h)**
+- [ ] Add `notifyWaiters()` method
+- [ ] Add `notifyTable()` method
+- [ ] Emit `bill_request:new` khi tạo
+- [ ] Emit `bill_request:accepted` khi accept
+- [ ] Emit `payment:completed` trong callbacks
+- [ ] Test với Socket.IO test tool
+- [ ] **Commit:** `git commit -m "feat(socket): add bill request events"`
+
+### **Phase 5: Testing (2h)**
+- [ ] Unit tests cho MomoService
+- [ ] Unit tests cho PaymentsService
+- [ ] Integration test: Bill request flow
+- [ ] **Commit:** `git commit -m "test(payment): add unit tests"`
+
+### **Phase 6: Documentation (1h)**
+- [ ] Update `.env.example` với tất cả payment vars
+- [ ] Update README nếu cần
+- [ ] **Commit:** `git commit -m "docs(payment): update environment variables"`
+
+### **Merge:**
 ```bash
-# Terminal 1: Start backend with ngrok
-cd backend
-npm run start:dev
-
-# Terminal 2: Expose with ngrok
-ngrok http 3000
-
-# Update .env with ngrok URL
-MOMO_IPN_URL=https://your-ngrok-url.ngrok.io/api/payments/momo/callback
-
-# Test create payment
-curl -X POST http://localhost:3000/api/payments/create \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "order_id": "uuid-here",
-    "method": "momo"
-  }'
-
-# Response:
-# {
-#   "payment_id": "...",
-#   "method": "momo",
-#   "payUrl": "https://test-payment.momo.vn/...",
-#   "qrCodeUrl": "https://test-payment.momo.vn/qr/..."
-# }
-
-# Scan QR code with MoMo app sandbox
-# MoMo will call webhook → Payment completed
-```
-
-### **Test 2: ZaloPay Payment**
-
-```bash
-curl -X POST http://localhost:3000/api/payments/create \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "order_id": "uuid-here",
-    "method": "zalopay"
-  }'
-
-# Response:
-# {
-#   "payment_id": "...",
-#   "method": "zalopay",
-#   "orderUrl": "https://sb-openapi.zalopay.vn/...",
-#   "zpTransToken": "..."
-# }
-```
-
-### **Test 3: VNPay Payment**
-
-```bash
-curl -X POST http://localhost:3000/api/payments/create \
-  -H "Authorization: Bearer YOUR_JWT_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "order_id": "uuid-here",
-    "method": "vnpay"
-  }'
-
-# Response:
-# {
-#   "payment_id": "...",
-#   "method": "vnpay",
-#   "paymentUrl": "https://sandbox.vnpayment.vn/..."
-# }
-```
-
-### **Test 4: Cash Payment**
-
-```bash
-# Step 1: Customer creates cash payment
-curl -X POST http://localhost:3000/api/payments/create \
-  -H "Authorization: Bearer CUSTOMER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "order_id": "uuid-here",
-    "method": "cash"
-  }'
-
-# Response:
-# {
-#   "payment_id": "payment-uuid",
-#   "method": "cash",
-#   "message": "Chờ waiter xác nhận thanh toán tiền mặt"
-# }
-
-# Step 2: Waiter confirms payment
-curl -X POST http://localhost:3000/api/payments/cash/confirm \
-  -H "Authorization: Bearer WAITER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "payment_id": "payment-uuid",
-    "cash_amount": 500000,
-    "notes": "Khách trả 500k"
-  }'
-
-# Response:
-# {
-#   "payment_id": "payment-uuid",
-#   "order_id": "order-uuid",
-#   "amount": 450000,
-#   "cash_received": 500000,
-#   "change": 50000,
-#   "status": "completed"
-# }
+git push origin feature/sprint3-task-3.1-batch-payment
+# Create PR on GitHub/GitLab
+# Request review
+# Merge to develop
 ```
 
 ---
 
-## 🔐 ENVIRONMENT VARIABLES
+## 🎯 NEXT TASK
 
-```bash
-# backend/.env
+Sau khi hoàn thành Task 3.1, tiếp tục với:
 
-# ========== MoMo Configuration ==========
-MOMO_PARTNER_CODE="MOMOBKUN20180529"
-MOMO_ACCESS_KEY="klm05TvNBzhg7h7j"
-MOMO_SECRET_KEY="at67qH6mk8w5Y1nAyMoYKMWACiEi2bsa"
-MOMO_API_URL="https://test-payment.momo.vn/v2/gateway/api"
-MOMO_REDIRECT_URL="http://localhost:5173/payment-result"
-MOMO_IPN_URL="https://your-ngrok-url.ngrok.io/api/payments/momo/callback"
+**→ [SPRINT3_TASK_3.2_PAYMENT_RECORDS_V2.md](./SPRINT3_TASK_3.2_PAYMENT_RECORDS_V2.md)** - Refund Logic
+CREATE INDEX idx_orders_table_status ON orders(table_id, status);
 
-# ========== ZaloPay Configuration ==========
-ZALOPAY_APP_ID="2553"
-ZALOPAY_KEY1="PcY4iZIKFCIdgZvA6ueMcMHHUbRLYjPL"
-ZALOPAY_KEY2="kLtgPl8HHhfvMuDHPwKfgfsY4Ydm9eIz"
-ZALOPAY_API_URL="https://sb-openapi.zalopay.vn/v2/create"
-ZALOPAY_CALLBACK_URL="https://your-ngrok-url.ngrok.io/api/payments/zalopay/callback"
-
-# ========== VNPay Configuration ==========
-VNPAY_TMN_CODE="DEMOVNPA"
-VNPAY_HASH_SECRET="EKOMYZHBPCTMXWKHXBFAVKUJGTZJQUXI"
-VNPAY_API_URL="https://sandbox.vnpayment.vn/paymentv2/vpcpay.html"
-VNPAY_RETURN_URL="http://localhost:5173/payment-result"
-VNPAY_IPN_URL="https://your-ngrok-url.ngrok.io/api/payments/vnpay/ipn"
-
-# ========== General ==========
-BACKEND_URL="http://localhost:3000"
-CASH_PAYMENT_ENABLED=true
+-- Thêm cho bill_requests
+CREATE INDEX idx_bill_requests_table_status ON bill_requests(table_id, status);
+CREATE INDEX idx_bill_requests_restaurant_status ON bill_requests(restaurant_id, status);
 ```
 
----
+### **Performance với 1 triệu orders:**
 
-## 📊 GIT COMMITS (12-14 commits)
-
-```bash
-git checkout -b feature/sprint3-task-3.1-payment-gateway develop
-
-# Database & Module Setup (3 commits)
-git add .
-git commit -m "feat(payment): tạo cấu trúc module payments với DTOs"
-
-git add prisma/
-git commit -m "feat(database): thêm bảng payment_methods và payments"
-
-git add prisma/
-git commit -m "feat(database): seed payment methods (momo, zalopay, vnpay, cash)"
-
-# MoMo Integration (2 commits)
-git add src/payments/momo.service.ts
-git commit -m "feat(payment): implement MoMo service với signature generation"
-
-git add src/payments/payments.service.ts src/payments/payments.controller.ts
-git commit -m "feat(payment): thêm MoMo webhook callback handler"
-
-# ZaloPay Integration (2 commits)
-git add src/payments/zalopay.service.ts
-git commit -m "feat(payment): implement ZaloPay service với MAC generation"
-
-git add src/payments/payments.service.ts src/payments/payments.controller.ts
-git commit -m "feat(payment): thêm ZaloPay callback handler"
-
-# VNPay Integration (2 commits)
-git add src/payments/vnpay.service.ts
-git commit -m "feat(payment): implement VNPay service với SecureHash"
-
-git add src/payments/payments.service.ts src/payments/payments.controller.ts
-git commit -m "feat(payment): thêm VNPay IPN handler"
-
-# Cash Payment (2 commits)
-git add src/payments/cash.service.ts
-git commit -m "feat(payment): implement cash payment service với change calculation"
-
-git add src/payments/payments.service.ts src/payments/payments.controller.ts
-git commit -m "feat(payment): thêm waiter confirmation cho cash payment"
-
-# Integration & Module (1 commit)
-git add src/payments/payments.module.ts src/app.module.ts
-git commit -m "feat(payment): tích hợp payments module vào app"
-
-# Testing & Documentation (2 commits)
-git add src/payments/**/*.spec.ts
-git commit -m "test(payment): thêm unit tests cho payment services"
-
-git add docs/
-git commit -m "docs(payment): viết hướng dẫn setup payment gateways"
-```
+| Query                       | Không Index | Có Index |
+| --------------------------- | ----------- | -------- |
+| Lấy unpaid orders của 1 bàn | ~500ms      | ~2ms     |
+| Lấy pending bill requests   | ~300ms      | ~1ms     |
 
 ---
 
-## ✅ CHECKLIST VỚI GIẢI THÍCH CHI TIẾT
+## 🚀 SUMMARY
 
-### **📦 Phase 1: Database Setup (1-2 giờ)**
+**Thay đổi chính:**
 
-#### **1.1 Tạo migration: `004_add_payment_methods.sql`**
-- [ ] Tạo file migration trong `prisma/migrations/`
-- [ ] Copy SQL code từ section "DATABASE SCHEMA" trong guide này
+1. **Thêm module `bill-requests`** - Quản lý yêu cầu thanh toán
+2. **Flow mới:** Customer request → Waiter accept → Payment
+3. **Batch payment:** Gộp nhiều orders → 1 payment
+4. **Tips support:** Customer có thể thêm tiền boa
+5. **QR on Waiter screen:** Waiter show QR cho customer scan
 
-**💡 Ý nghĩa:** 
-- Tạo bảng `payment_methods` để quản lý 4 phương thức thanh toán
-- Tạo bảng `payments` với đầy đủ fields cho online & cash payments
-- Tách biệt payment method config → dễ thêm/bớt methods sau này
-
-**✅ Kết quả:** File SQL migration sẵn sàng để chạy
-
----
-
-#### **1.2 Update Prisma schema với PaymentMethod & Payment models**
-- [ ] Mở file `prisma/schema.prisma`
-- [ ] Thêm model `PaymentMethod` (code từ guide)
-- [ ] Update model `Payment` với gateway fields + cash fields + refund fields
-- [ ] Update model `User` với payment relations
-- [ ] Update model `Order` với payment relation
-
-**💡 Ý nghĩa:**
-- Prisma schema = "bản vẽ" database → Type-safe queries
-- Relations giúp query dễ dàng: `payment.order`, `payment.payment_method`
-- Optional fields (?) cho flexibility: cash_amount?, gateway_trans_id?
-
-**✅ Kết quả:** Schema file updated, Prisma có thể generate types
-
----
-
-#### **1.3 Run migration: `npm run migrate`**
-- [ ] Terminal: `cd backend`
-- [ ] Chạy: `npm run migrate` hoặc `npx prisma migrate dev`
-- [ ] Xác nhận migration name khi được hỏi
-
-**💡 Ý nghĩa:**
-- Apply migration → Tạo tables thật trong database
-- Prisma auto-generate TypeScript types từ schema
-- Database structure ready cho implementation
-
-**✅ Kết quả:** Tables `payment_methods` và `payments` tồn tại trong DB
-
----
-
-#### **1.4 Seed payment methods**
-- [ ] Chạy INSERT statements từ migration file
-- [ ] Hoặc tạo seed script: `prisma/seed-payments.ts`
-- [ ] Verify: Query database để check 4 methods đã tồn tại
-
-**💡 Ý nghĩa:**
-- Seed data = dữ liệu mặc định ban đầu
-- 4 methods: momo, zalopay, vnpay, cash
-- Mỗi method có code, name, description, display_order
-
-**✅ Kết quả:** 4 payment methods trong bảng `payment_methods`
-
----
-
-#### **1.5 Update PrismaService**
-- [ ] Mở `backend/src/prisma/prisma.service.ts`
-- [ ] ✅ **ĐÃ CÓ:** `this.payment = this.client.payments`
-- [ ] ✅ **ĐÃ CÓ:** `this.paymentMethod = this.client.payment_methods`
-
-**💡 Ý nghĩa:**
-- Expose payment models qua PrismaService
-- Dùng được: `this.prisma.payment.findMany()`, `this.prisma.paymentMethod.findUnique()`
-- Consistent với cách access models khác (order, user, etc.)
-
-**✅ Kết quả:** Payment models accessible trong services
-
----
-
-### **🛠️ Phase 2: Payment Services (6-8 giờ)**
-
-#### **2.1 Tạo payments module structure**
-- [ ] `nest g module payments`
-- [ ] `nest g controller payments`
-- [ ] `nest g service payments`
-- [ ] `nest g service payments/momo`
-- [ ] `nest g service payments/zalopay`
-- [ ] `nest g service payments/vnpay`
-- [ ] `nest g service payments/cash`
-
-**💡 Ý nghĩa:**
-- Module pattern = tổ chức code gọn gàng
-- Mỗi gateway có service riêng → Dễ maintain
-- Main PaymentsService làm routing logic
-
-**✅ Kết quả:** Folder structure:
-```
-payments/
-├── payments.module.ts
-├── payments.controller.ts
-├── payments.service.ts
-├── momo.service.ts
-├── zalopay.service.ts
-├── vnpay.service.ts
-├── cash.service.ts
-└── dto/
-```
-
----
-
-#### **2.2 Implement MoMoService**
-- [ ] Tạo methods: `createPayment()`, `verifySignature()`
-- [ ] HMAC SHA256 signature generation
-- [ ] Axios POST request đến MoMo API
-- [ ] Error handling
-
-**💡 Ý nghĩa:**
-- MoMo yêu cầu signature chính xác → Security
-- Raw signature phải theo thứ tự exact từ docs
-- Return `payUrl` và `qrCodeUrl` cho customer
-
-**✅ Kết quả:** MoMo payment request hoạt động, nhận được QR code URL
-
----
-
-#### **2.3 Implement ZaloPayService**
-- [ ] Tạo methods: `createOrder()`, `verifyCallback()`
-- [ ] MAC generation với crypto.createHmac()
-- [ ] Handle ZaloPay response format
-
-**💡 Ý nghĩa:**
-- ZaloPay dùng MAC (Message Authentication Code) thay vì signature
-- Format khác MoMo: zpTransToken, app_trans_id
-- Callback verification quan trọng cho security
-
-**✅ Kết quả:** ZaloPay order creation hoạt động
-
----
-
-#### **2.4 Implement VNPayService**
-- [ ] Tạo methods: `createPaymentUrl()`, `verifyIPN()`
-- [ ] SecureHash SHA512 generation
-- [ ] URL encoding cho params
-- [ ] Sort params by key (VNPay requirement)
-
-**💡 Ý nghĩa:**
-- VNPay khác biệt: return URL thay vì API response
-- Amount phải * 100 (VNPay tính bằng VND không có decimal)
-- IPN (Instant Payment Notification) = webhook của VNPay
-
-**✅ Kết quả:** VNPay payment URL generated correctly
-
----
-
-#### **2.5 Implement CashPaymentService**
-- [ ] Tạo method: `calculateChange()`
-- [ ] Validation: cashAmount >= orderAmount
-- [ ] Error messages rõ ràng
-
-**💡 Ý nghĩa:**
-- Cash payment đơn giản nhất: không cần API call
-- Chỉ cần logic tính tiền thối
-- Validation prevent waiter mistakes
-
-**✅ Kết quả:** Cash payment calculation logic ready
-
----
-
-#### **2.6 Implement PaymentsService (main)**
-- [ ] Method `createPayment()`: Route to correct gateway service
-- [ ] Method `handleMoMoCallback()`: Process MoMo webhook
-- [ ] Method `handleZaloPayCallback()`: Process ZaloPay callback
-- [ ] Method `handleVNPayIPN()`: Process VNPay IPN
-- [ ] Method `confirmCashPayment()`: Waiter confirmation
-- [ ] Method `getPaymentStatus()`: Check payment status
-- [ ] Integration với OrdersService (update order status)
-- [ ] Integration với NotificationsService (real-time updates)
-
-**💡 Ý nghĩa:**
-- Main service = "bộ não" điều phối tất cả gateways
-- Switch case theo method: momo/zalopay/vnpay/cash
-- Database transactions: Create payment → Update order → Send notification
-- Error handling: Rollback if gateway fails
-
-**✅ Kết quả:** Complete payment flow từ request → callback → complete
-
----
-
-#### **2.7 Implement PaymentsController**
-- [ ] `POST /api/payments/create` - Tạo payment (có auth)
-- [ ] `POST /api/payments/momo/callback` - MoMo webhook (no auth)
-- [ ] `POST /api/payments/zalopay/callback` - ZaloPay callback (no auth)
-- [ ] `GET /api/payments/vnpay/ipn` - VNPay IPN (no auth)
-- [ ] `POST /api/payments/cash/confirm` - Waiter confirm (auth + role)
-- [ ] `GET /api/payments/:orderId/status` - Check status (có auth)
-- [ ] `GET /api/payments/methods` - Get active methods (public)
-
-**💡 Ý nghĩa:**
-- Controller = entry point cho HTTP requests
-- Webhook endpoints KHÔNG cần auth (gateways gọi trực tiếp)
-- Role guards: cash confirm chỉ cho waiter/admin
-- DTO validation automatic với class-validator
-
-**✅ Kết quả:** All payment APIs accessible, properly secured
-
----
-
-#### **2.8 Add role guards (waiter for cash confirm)**
-- [ ] Import RolesGuard từ auth module
-- [ ] Decorator @Roles('waiter', 'admin') cho cash endpoints
-- [ ] Verify waiter có thể confirm, customer không thể
-
-**💡 Ý nghĩa:**
-- Security: Chỉ waiter mới confirm cash payments
-- Prevent fraud: Customer không thể tự confirm payment của mình
-- Admin có full access cho troubleshooting
-
-**✅ Kết quả:** Cash payment security enforced
-
----
-
-#### **2.9 Integrate with NotificationsService**
-- [ ] Import NotificationsModule vào PaymentsModule
-- [ ] Inject NotificationsService vào PaymentsService constructor
-- [ ] Send notification sau mỗi payment success
-- [ ] Send notification cho cash refund pending
-
-**💡 Ý nghĩa:**
-- Real-time updates: Customer biết payment thành công ngay
-- Waiter receive alert: "Cash payment cần confirm"
-- Admin monitoring: Track all payment events
-- Socket.IO broadcast đến correct users
-
-**✅ Kết quả:** Real-time payment notifications hoạt động
-
----
-
-### **🌐 Phase 3: Environment Setup (1 giờ)**
-
-#### **3.1 Đăng ký MoMo sandbox account**
-- [ ] Truy cập: https://developers.momo.vn/
-- [ ] Register account
-- [ ] Get sandbox credentials: PARTNER_CODE, ACCESS_KEY, SECRET_KEY
-- [ ] Copy vào .env
-
-**💡 Ý nghĩa:**
-- Sandbox = môi trường test, không charge tiền thật
-- Credentials khác production → An toàn khi test
-
----
-
-#### **3.2 Đăng ký ZaloPay sandbox account**
-- [ ] Truy cập: https://docs.zalopay.vn/
-- [ ] Get sandbox APP_ID, KEY1, KEY2
-- [ ] Copy vào .env
-
----
-
-#### **3.3 Đăng ký VNPay sandbox account**
-- [ ] Truy cập: https://sandbox.vnpayment.vn/
-- [ ] Get sandbox TMN_CODE, HASH_SECRET
-- [ ] Copy vào .env
-
----
-
-#### **3.4 Setup ngrok cho webhook/IPN**
-- [ ] Download ngrok: https://ngrok.com/
-- [ ] Run: `ngrok http 3000`
-- [ ] Copy public URL (vd: https://abc123.ngrok.io)
-- [ ] Update .env:
-  ```
-  MOMO_IPN_URL=https://abc123.ngrok.io/api/payments/momo/callback
-  ZALOPAY_CALLBACK_URL=https://abc123.ngrok.io/api/payments/zalopay/callback
-  VNPAY_IPN_URL=https://abc123.ngrok.io/api/payments/vnpay/ipn
-  ```
-
-**💡 Ý nghĩa:**
-- Gateways cần public URL để gọi webhook
-- Localhost không public → Dùng ngrok làm tunnel
-- Production: Không cần ngrok, dùng domain thật
-
-**⚠️ Lưu ý:** Mỗi lần restart ngrok → URL thay đổi → Phải update .env
-
----
-
-#### **3.5 Configure .env với credentials**
-- [ ] Paste tất cả credentials vào backend/.env
-- [ ] Verify format: KEY="value" (có quotes)
-- [ ] Restart backend để load env variables
-
-**💡 Ý nghĩa:**
-- Environment variables = configuration không hard-code
-- Git ignore .env → Secrets không leak
-
-**✅ Kết quả:** Backend có đủ credentials để gọi gateways
-
----
-
-### **🧪 Phase 4: Testing (3-4 giờ)**
-
-#### **4.1 Test MoMo payment flow**
-- [ ] Create payment với method="momo"
-- [ ] Nhận được payUrl và qrCodeUrl
-- [ ] Scan QR code bằng MoMo app sandbox
-- [ ] Complete payment trong app
-- [ ] Verify webhook được gọi (check backend logs)
-- [ ] Verify payment status = completed trong DB
-- [ ] Verify order status = completed
-- [ ] Verify customer nhận notification
-
-**💡 Ý nghĩa:**
-- End-to-end test: Từ request → gateway → webhook → complete
-- MoMo sandbox: Dùng test account, không charge tiền
-- Logs quan trọng: Check signature validation, API responses
-
-**✅ Pass criteria:** Payment completed, order updated, notification sent
-
----
-
-#### **4.2 Test ZaloPay payment flow**
-- [ ] Similar steps như MoMo
-- [ ] Verify ZaloPay callback được process
-- [ ] Check MAC verification
-
----
-
-#### **4.3 Test VNPay payment flow**
-- [ ] Create payment với method="vnpay"
-- [ ] Redirect đến VNPay URL
-- [ ] Complete payment (sandbox test card)
-- [ ] Verify IPN được gọi
-- [ ] Check SecureHash verification
-
----
-
-#### **4.4 Test cash payment flow**
-- [ ] Customer create payment với method="cash"
-- [ ] Verify payment status = pending
-- [ ] Waiter login, view pending payments
-- [ ] Waiter confirm với cash_amount
-- [ ] Verify change_amount tính đúng
-- [ ] Verify payment status = completed
-- [ ] Verify customer nhận notification
-
-**💡 Ý nghĩa:**
-- Cash flow khác: 2-step process
-- Test role guard: Customer không thể tự confirm
-- Test validation: cash_amount < order_amount → Error
-
----
-
-#### **4.5 Test callback/IPN signature verification**
-- [ ] Manually gửi callback với wrong signature
-- [ ] Verify backend reject (401/403)
-- [ ] Verify payment không được update
-
-**💡 Ý nghĩa:**
-- Security test: Prevent fake callbacks
-- Gateway authenticity verification
-
-**✅ Pass criteria:** Invalid signatures rejected
-
----
-
-#### **4.6 Test order status update**
-- [ ] Verify order status progression: pending → served → completed
-- [ ] Test multiple payments cho cùng order (should fail)
-- [ ] Test payment cho cancelled order (should fail)
-
----
-
-#### **4.7 Test notifications**
-- [ ] Verify Socket.IO connections
-- [ ] Check customer receives payment_success event
-- [ ] Check admin receives payment notifications
-- [ ] Check waiter receives cash_payment_pending
-
-**💡 Ý nghĩa:**
-- Real-time critical: Customer cần feedback ngay lập tức
-- Test với multiple clients connected
-
----
-
-### **📚 Phase 5: Documentation (1 giờ)**
-
-#### **5.1 Setup guide cho từng payment gateway**
-- [ ] MoMo setup steps
-- [ ] ZaloPay setup steps
-- [ ] VNPay setup steps
-- [ ] Ngrok setup guide
-- [ ] Screenshots nếu cần
-
-**💡 Ý nghĩa:**
-- Team members khác cần setup local environment
-- Production deployment checklist
-
----
-
-#### **5.2 API documentation**
-- [ ] Swagger/OpenAPI documentation
-- [ ] Request/response examples
-- [ ] Error codes và messages
-- [ ] Authentication requirements
-
----
-
-#### **5.3 Troubleshooting guide**
-- [ ] Common errors và solutions
-- [ ] Signature mismatch debugging
-- [ ] Webhook không được gọi → Check ngrok
-- [ ] Payment stuck pending → Manual check
-
-**💡 Ý nghĩa:**
-- Debug faster khi production issues
-- Common pitfalls documented
-
-**✅ Kết quả:** Complete documentation cho payment system
-
----
-
-## 🎯 DEFINITION OF DONE
-
-**Task 3.1 hoàn thành KHI:**
-- ✅ Tất cả 4 payment methods hoạt động (MoMo, ZaloPay, VNPay, Cash)
-- ✅ Webhooks/callbacks/IPNs process correctly
-- ✅ Signature verification pass
-- ✅ Order status update automatically
-- ✅ Real-time notifications work
-- ✅ All tests pass (unit + integration)
-- ✅ Documentation complete
-- ✅ Code review approved
-- ✅ Merged vào develop branch
-
-**Không được skip:**
-- ❌ Không test signature verification
-- ❌ Không test cash payment với waiter
-- ❌ Không verify notifications
-- ❌ Không document setup steps
-
----
-
-## 📖 TÀI LIỆU THAM KHẢO
-
-### **MoMo:**
-- 📘 [MoMo Developer Docs](https://developers.momo.vn/)
-- 🔐 [Sandbox Testing Guide](https://developers.momo.vn/v3/docs/payment/onboarding/test-instructions/)
-- 📱 [QR Code Payment](https://developers.momo.vn/v3/docs/payment/api/payment-api/qr/)
-
-### **ZaloPay:**
-- 📘 [ZaloPay API Docs](https://docs.zalopay.vn/v2/)
-- 🔐 [Sandbox Environment](https://docs.zalopay.vn/v2/start/sandbox.html)
-- 🔑 [MAC Generation](https://docs.zalopay.vn/v2/general/overview.html#mac-generation)
-
-### **VNPay:**
-- 📘 [VNPay API Documentation](https://sandbox.vnpayment.vn/apis/)
-- 🏦 [Merchant Portal](https://sandbox.vnpayment.vn/)
-- 🔐 [SecureHash Algorithm](https://sandbox.vnpayment.vn/apis/docs/huong-dan-tich-hop/)
-
----
-
-**⏱ Estimated Time:** 14-16 giờ  
-**🎯 Priority:** Critical  
-**👥 Assignee:** Hải (Backend)
-
----
-
-**✅ Task completion = 4 payment methods hoạt động + Tests pass + Documentation complete**
+**Thời gian estimate:** 16-18 giờ (tăng 2h so với phiên bản cũ)
